@@ -17,4 +17,6 @@ langchain-ollama>=0.1.0
 DrissionPage>=4.0.0
 selenium>=4.0.0
 openpyxl>=3.0.0
-
+pyecharts
+echarts-china-provinces-pypkg
+echarts-china-cities-pypkg
