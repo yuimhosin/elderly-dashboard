@@ -13,6 +13,12 @@ from datetime import datetime
 from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
+try:
+    from openai import OpenAI
+    DEEPSEEK_CLIENT_AVAILABLE = True
+except ImportError:
+    DEEPSEEK_CLIENT_AVAILABLE = False
+
 # PDF导出相关导入
 try:
     from reportlab.lib.pagesizes import A4, letter
@@ -198,7 +204,241 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         st.warning("数据中未找到'序号'列，无法进行统计分析。")
         return
     
-    # 1. 按数量和费用统计项目，计算与预算差值
+    # 标签池：先选择需要分析的字段，再展示对应统计
+    st.markdown("### 🔖 标签池（选择需要分析的字段）")
+    all_tags = [
+        "社区（园区）",
+        "所属区域",
+        "所属业态",
+        "项目分级",
+        "项目分类",
+        "拟定承建组织",
+        "总部重点关注项目",
+        "专业",
+        "专业分包",
+        "项目名称",
+        "备注说明",
+        "拟定金额",
+    ]
+    default_tags = st.session_state.get(
+        "tag_pool_selection",
+        ["社区（园区）", "所属区域", "项目分级", "专业", "专业分包", "拟定金额"],
+    )
+    selected_tags = st.multiselect(
+        "请选择本次分析要关注的字段（至少选择一个）：",
+        options=all_tags,
+        default=[t for t in default_tags if t in all_tags],
+        help=(
+            "示例：\n"
+            "- 只看区域对比：勾选「所属区域」「拟定金额」。\n"
+            "- 看分级与专业：勾选「项目分级」「专业」「拟定金额」。\n"
+            "- 只看社区层面的统计：勾选「社区（园区）」「拟定金额」。"
+        ),
+    )
+    st.session_state["tag_pool_selection"] = selected_tags
+
+    if not selected_tags:
+        st.info("请先在上方的标签池中至少选择一个字段，然后将根据选择展示对应的统计图表。")
+        return
+
+    show_park = "社区（园区）" in selected_tags
+    show_region = "所属区域" in selected_tags
+    show_prof_subcontract = "专业分包" in selected_tags
+    show_level_stats = "项目分级" in selected_tags
+    use_amount_filter = "拟定金额" in selected_tags
+    show_business_type = "所属业态" in selected_tags
+    show_category = "项目分类" in selected_tags
+    show_contractor = "拟定承建组织" in selected_tags
+    show_focus = "总部重点关注项目" in selected_tags
+    show_prof = "专业" in selected_tags
+
+    # 按标签构造筛选条件，例如：华东地区 + 一级项目 + 金额区间
+    st.markdown("### 🎯 标签筛选条件（可选）")
+    col_region, col_level, col_amount = st.columns(3)
+    selected_regions = []
+    selected_levels = []
+    amount_min = amount_max = None
+    selected_business_types = []
+    selected_categories = []
+    selected_contractors = []
+    selected_focus = []
+    selected_profs = []
+    selected_prof_subcontracts = []
+
+    if show_region and "所属区域" in sub.columns:
+        with col_region:
+            region_opts = (
+                sub["所属区域"]
+                .dropna()
+                .astype(str)
+                .replace("其他", pd.NA)
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            region_opts = sorted(region_opts)
+            selected_regions = st.multiselect(
+                "选择所属区域",
+                options=region_opts,
+                help="例如：只看华东地区时，勾选「华东」。可多选。",
+            )
+
+    if show_level_stats and "项目分级" in sub.columns:
+        with col_level:
+            level_opts = (
+                sub["项目分级"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+            level_opts = sorted(level_opts)
+            selected_levels = st.multiselect(
+                "选择项目分级",
+                options=level_opts,
+                help="例如：只看一级项目时，勾选「一级」。可多选。",
+            )
+
+    if use_amount_filter and "拟定金额" in sub.columns:
+        with col_amount:
+            try:
+                min_val = float(sub["拟定金额"].min() or 0)
+                max_val = float(sub["拟定金额"].max() or 0)
+            except Exception:
+                min_val, max_val = 0.0, 0.0
+            if max_val < min_val:
+                max_val = min_val
+            if min_val == max_val:
+                amount_min, amount_max = min_val, max_val
+                st.write(f"拟定金额范围：{min_val:,.0f} 万元")
+            else:
+                amount_min, amount_max = st.slider(
+                    "拟定金额范围（万元）",
+                    min_value=float(min_val),
+                    max_value=float(max_val),
+                    value=(float(min_val), float(max_val)),
+                    step=max(1.0, (max_val - min_val) / 100),
+                    help="例如：选择最大值为 500，则表示筛选「五百万以内」的项目。",
+                )
+
+    # 其他标签字段的多选筛选
+    if show_business_type and "项目业态" in sub.columns:
+        business_opts = (
+            sub["项目业态"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        business_opts = sorted(business_opts)
+        selected_business_types = st.multiselect(
+            "选择所属业态",
+            options=business_opts,
+            help="例如：只看某一业态的项目时，在此勾选对应业态。",
+        )
+
+    if show_category and "项目分类" in sub.columns:
+        category_opts = (
+            sub["项目分类"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        category_opts = sorted(category_opts)
+        selected_categories = st.multiselect(
+            "选择项目分类",
+            options=category_opts,
+            help="例如：只看某一类项目时，在此勾选对应分类。",
+        )
+
+    if show_contractor and "拟定承建组织" in sub.columns:
+        contractor_opts = (
+            sub["拟定承建组织"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        contractor_opts = sorted(contractor_opts)
+        selected_contractors = st.multiselect(
+            "选择拟定承建组织",
+            options=contractor_opts,
+            help="例如：只看由某个承建组织负责的项目时，在此勾选对应承建组织。",
+        )
+
+    if show_focus and "总部重点关注项目" in sub.columns:
+        focus_opts = (
+            sub["总部重点关注项目"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        focus_opts = sorted(focus_opts)
+        selected_focus = st.multiselect(
+            "选择总部重点关注项目标记",
+            options=focus_opts,
+            help="例如：只看总部重点关注的项目时，在此勾选「是」或对应标记。",
+        )
+
+    if show_prof and "专业" in sub.columns:
+        prof_opts = (
+            sub["专业"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        prof_opts = sorted(prof_opts)
+        selected_profs = st.multiselect(
+            "选择专业",
+            options=prof_opts,
+            help="例如：只看电梯系统或供配电系统等某几个专业。",
+        )
+
+    if show_prof_subcontract and ("专业分包" in sub.columns or "专业细分" in sub.columns):
+        col_name = "专业分包" if "专业分包" in sub.columns else "专业细分"
+        sub_prof = sub[col_name].dropna().astype(str)
+        prof_sub_opts = sorted(sub_prof.unique().tolist())
+        selected_prof_subcontracts = st.multiselect(
+            "选择专业分包",
+            options=prof_sub_opts,
+            help="例如：只看某几个专业分包类型。",
+        )
+
+    # 应用筛选条件到子集数据
+    if selected_regions:
+        sub = sub[sub["所属区域"].isin(selected_regions)]
+    if selected_levels:
+        sub = sub[sub["项目分级"].isin(selected_levels)]
+    if (
+        use_amount_filter
+        and amount_min is not None
+        and amount_max is not None
+        and "拟定金额" in sub.columns
+    ):
+        sub = sub[(sub["拟定金额"] >= amount_min) & (sub["拟定金额"] <= amount_max)]
+
+    if selected_business_types and "项目业态" in sub.columns:
+        sub = sub[sub["项目业态"].isin(selected_business_types)]
+    if selected_categories and "项目分类" in sub.columns:
+        sub = sub[sub["项目分类"].isin(selected_categories)]
+    if selected_contractors and "拟定承建组织" in sub.columns:
+        sub = sub[sub["拟定承建组织"].isin(selected_contractors)]
+    if selected_focus and "总部重点关注项目" in sub.columns:
+        sub = sub[sub["总部重点关注项目"].isin(selected_focus)]
+    if selected_profs and "专业" in sub.columns:
+        sub = sub[sub["专业"].isin(selected_profs)]
+    if selected_prof_subcontracts and ("专业分包" in sub.columns or "专业细分" in sub.columns):
+        col_name = "专业分包" if "专业分包" in sub.columns else "专业细分"
+        sub = sub[sub[col_name].astype(str).isin(selected_prof_subcontracts)]
+
+    if sub.empty:
+        st.warning("根据当前标签筛选条件，未找到任何项目，请调整区域 / 项目分级或金额范围后重试。")
+        return
+
+    # 1. 按数量和费用统计项目，计算与预算差值（只要选择了任意标签就展示整体概览）
     st.markdown("### 📊 项目数量与费用统计")
     total_count = len(sub)
     total_amount = sub["拟定金额"].sum() if "拟定金额" in sub.columns else 0
@@ -249,17 +489,18 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
     with col4:
         st.metric("差值（万元）", f"{diff:,.0f}", delta=f"{diff:,.0f}" if diff != 0 else None)
     
-    # 按园区统计
-    st.markdown("#### 按园区统计")
-    park_stats = sub.groupby("园区", dropna=False).agg(
-        项目数=("序号", "count"),
-        金额合计=("拟定金额", "sum"),
-    ).reset_index()
-    park_stats["金额合计"] = park_stats["金额合计"].round(2)
-    st.dataframe(park_stats, use_container_width=True, hide_index=True)
+    # 按园区统计（仅当在标签池中选择了“社区（园区）”时展示）
+    if show_park:
+        st.markdown("#### 按园区统计")
+        park_stats = sub.groupby("园区", dropna=False).agg(
+            项目数=("序号", "count"),
+            金额合计=("拟定金额", "sum"),
+        ).reset_index()
+        park_stats["金额合计"] = park_stats["金额合计"].round(2)
+        st.dataframe(park_stats, use_container_width=True, hide_index=True)
     
-    # 按区域统计（如果存在所属区域列）
-    if "所属区域" in sub.columns:
+    # 按区域统计（仅当存在所属区域列且在标签池中勾选“所属区域”时展示）
+    if show_region and "所属区域" in sub.columns:
         st.markdown("#### 按所属区域统计")
         region_stats = sub.groupby("所属区域", dropna=False).agg(
             项目数=("序号", "count"),
@@ -285,8 +526,8 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
     
     st.markdown("---")
     
-    # 按专业分包统计（如果存在该列）
-    if "专业分包" in sub.columns or "专业细分" in sub.columns:
+    # 按专业分包统计（如果存在该列且在标签池中勾选“专业分包”）
+    if show_prof_subcontract and ("专业分包" in sub.columns or "专业细分" in sub.columns):
         prof_subcontract_col = "专业分包" if "专业分包" in sub.columns else "专业细分"
         st.markdown("### 📦 按专业分包统计")
         by_prof_subcontract = sub.groupby(prof_subcontract_col, dropna=False).agg(
@@ -345,9 +586,10 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
     
     st.markdown("---")
     
-    # 2. 一类、二类、三类项目占比统计
-    st.markdown("### 📈 项目分级占比统计")
-    if "项目分级" in sub.columns:
+    # 2. 一类、二类、三类项目占比统计（仅当在标签池中勾选“项目分级”）
+    if show_level_stats:
+        st.markdown("### 📈 项目分级占比统计")
+    if show_level_stats and "项目分级" in sub.columns:
         # 映射：一级->一类，二级->二类，三级->三类
         level_mapping = {"一级": "一类", "二级": "二类", "三级": "三类"}
         sub_copy = sub.copy()
@@ -5005,6 +5247,62 @@ def generate_pdf_report(df: pd.DataFrame, 园区选择: list, output_path: str =
     return generate_pdf_report_html(df, 园区选择, output_path)
 
 
+def _get_deepseek_client(api_key: str | None):
+    """构造 DeepSeek 客户端。"""
+    if not (DEEPSEEK_CLIENT_AVAILABLE and api_key):
+        return None
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com",
+        )
+        return client
+    except Exception:
+        return None
+
+
+def _answer_with_deepseek(api_key: str | None, question: str, df: pd.DataFrame) -> str:
+    """调用 DeepSeek 接口回答使用说明或分析问题。"""
+    client = _get_deepseek_client(api_key)
+    if client is None:
+        return (
+            "未检测到可用的 DeepSeek 客户端。\n\n"
+            "请在左侧或当前页中正确填写 DeepSeek API Key（建议使用 Streamlit Secrets 或环境变量），"
+            "或联系管理员配置后再重试。"
+        )
+    # 只提供列信息，不传输完整数据
+    cols = list(df.columns)[:30]
+    system_prompt = (
+        "你是一个面向业务同事的中文 AI 助手，负责解答关于“养老社区改良改造进度管理看板”的使用问题，"
+        "并根据已经加载到应用中的 DataFrame 数据给出简单的数据查询建议。\n\n"
+        "返回要求：\n"
+        "1. 用简体中文回答。\n"
+        "2. 如果问题是“如何使用”类（例如如何上传、如何手动输入数据），请用步骤化说明回答。\n"
+        "3. 如果是“帮我查找/统计”类问题，请：\n"
+        "   - 先用自然语言说明大致的筛选逻辑（比如要按哪个字段、什么条件过滤、是否与月份有关等）；\n"
+        "   - 给出用户可以在当前看板中如何操作的指引（例如去哪个 Tab、用哪些筛选器）。\n"
+        "4. 不要编造不存在的字段名，字段名仅限于下面这批实际存在的列。\n"
+    )
+    user_prompt = (
+        f"用户问题：{question}\n\n"
+        f"当前数据列名如下（最多 30 个）：{', '.join(cols)}\n\n"
+        "注意：你无法直接访问完整数据，只能基于这些列名和业务含义来回答和给出操作建议。"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content or ""
+        return content.strip()
+    except Exception as e:
+        return f"调用 DeepSeek 接口失败：{e}"
+
+
 def render_地图与统计(df: pd.DataFrame, 园区选择: list):
     """地图与统计 Tab：中国地图 + 按专业/分级/园区/区域图表。"""
     df_with_location = _add_城市和区域列(df)
@@ -5440,7 +5738,7 @@ def main():
     
     render_审核流程说明()
 
-    tab1, tab2, tab3 = st.tabs(["项目统计分析", "地图与统计", "全部项目"])
+    tab1, tab2, tab3, tab4 = st.tabs(["项目统计分析", "地图与统计", "全部项目", "AI 助手"])
     with tab1:
         render_项目统计分析(df, 园区选择)
     with tab2:
@@ -5452,6 +5750,67 @@ def main():
         display_cols = ["园区", "所属区域", "城市"] + [c for c in df.columns if c not in ["园区", "所属区域", "城市"]]
         display_cols = [c for c in display_cols if c in df.columns]
         st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+    with tab4:
+        st.subheader("AI 助手（DeepSeek 驱动）")
+        st.markdown(
+            """
+            这个 AI 窗口用于：\n
+            - 解答本网页的 **使用说明**（如如何上传数据、如何手动录入、各个标签页含义等）；\n
+            - 帮你根据当前已加载的数据给出 **查询与筛选的建议**（例如：“帮我查找三月立项的项目”）。\n
+            """
+        )
+        # DeepSeek API Key 输入（不在代码中硬编码，避免泄露）
+        api_key = st.text_input(
+            "DeepSeek API Key（仅本次会话使用）",
+            type="password",
+            value=st.session_state.get("deepseek_api_key", ""),
+            help="出于安全考虑，建议通过环境变量或 Streamlit Secrets 配置，在公开仓库中不要硬编码密钥。",
+        )
+        st.session_state["deepseek_api_key"] = api_key
+
+        if "ai_messages" not in st.session_state:
+            st.session_state["ai_messages"] = [
+                {
+                    "role": "assistant",
+                    "content": "你好，我是本看板的 AI 助手，可以回答使用问题，也可以帮你构思如何在当前页面筛选数据。",
+                }
+            ]
+
+        # 展示历史对话
+        for msg in st.session_state["ai_messages"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # 接收新问题
+        question = st.chat_input("请输入你的问题，例如：如何上传数据？或：帮我查找三月立项的项目。")
+        if question:
+            st.session_state["ai_messages"].append({"role": "user", "content": question})
+            # 先处理简单的本地数据查询示例：三月立项的项目
+            found_df = None
+            if "三月" in question and ("立项" in question or "需求立项" in question):
+                if "需求立项" in df.columns:
+                    dt = pd.to_datetime(df["需求立项"], errors="coerce", format="mixed")
+                    mask = dt.notna() & (dt.dt.month == 3)
+                    found_df = df.loc[mask].copy()
+
+            with st.chat_message("assistant"):
+                answer = _answer_with_deepseek(api_key, question, df)
+                st.markdown(answer)
+                # 如果有三月立项示例查询结果，则在 AI 回复下方补充一个表格
+                if found_df is not None:
+                    if found_df.empty:
+                        st.info("在当前数据中，未找到 3 月份立项的项目（需求立项日期在 3 月）。")
+                    else:
+                        st.markdown(f"**额外查询结果：共找到 {len(found_df)} 条 3 月份立项的项目（仅展示前 50 条）：**")
+                        show_cols = [c for c in ["园区", "项目名称", "项目分级", "专业", "拟定金额", "需求立项"] if c in found_df.columns]
+                        if not show_cols:
+                            show_cols = found_df.columns.tolist()
+                        st.dataframe(
+                            found_df[show_cols].head(50),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                st.session_state["ai_messages"].append({"role": "assistant", "content": answer})
 
 
 if __name__ == "__main__":
