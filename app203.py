@@ -1224,6 +1224,249 @@ def _add_城市和区域列(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _build_城市_园区明细(df: pd.DataFrame) -> dict:
+    """按城市汇总，每个城市下为各园区的：园区名称、项目总数、总预算。供地图 tooltip 使用。"""
+    sub = df[df["城市"].notna() & (df["城市"] != "其他")]
+    if sub.empty:
+        return {}
+    by_city_park = sub.groupby(["城市", "园区"], dropna=False).agg(
+        项目数=("序号", "count"),
+        金额合计=("拟定金额", "sum"),
+    ).reset_index()
+    out = {}
+    for city in by_city_park["城市"].unique():
+        rows = by_city_park[by_city_park["城市"] == city]
+        parks = []
+        total_n = 0
+        total_a = 0
+        for _, r in rows.iterrows():
+            n = int(r["项目数"])
+            a = int(r["金额合计"])
+            parks.append({"园区名称": str(r["园区"]), "项目数": n, "预算万元": int(round(a))})
+            total_n += n
+            total_a += a
+        out[str(city)] = {"项目总数": total_n, "总预算万元": int(round(total_a)), "园区列表": parks}
+    return out
+
+
+def _render_中国地图(df: pd.DataFrame, city_tooltip_data: dict):
+    """中国地图：悬浮显示城市下各园区详情；点击城市后通过 URL 参数筛选并跳转下方详情。"""
+    try:
+        from pyecharts.charts import Geo
+        from pyecharts import options as opts
+        from pyecharts.commons.utils import JsCode
+    except ImportError:
+        st.warning("请安装 pyecharts：pip install pyecharts")
+        st.info("如果已安装，请尝试：pip install pyecharts -U")
+        st.info("地图显示还需要安装地图数据包：pip install echarts-china-provinces-pypkg echarts-china-cities-pypkg")
+        return
+    
+    # 检查数据是否为空
+    if df.empty:
+        st.warning("数据为空，无法显示地图。")
+        return
+    
+    # 检查是否有城市列
+    if "城市" not in df.columns:
+        st.warning("数据中缺少'城市'列，无法显示地图。")
+        return
+    
+    by_city = df.groupby("城市", dropna=False).agg(
+        项目数=("序号", "count"),
+        金额合计=("拟定金额", "sum"),
+    ).reset_index()
+    
+    data = []
+    for _, row in by_city.iterrows():
+        city = row["城市"]
+        if city in 城市_COORDS and city != "其他":
+            data.append((city, int(row["项目数"])))
+    
+    if not data:
+        st.info("当前数据中暂无已配置区位的城市，或请先在侧边栏选择园区。")
+        st.info(f"数据中的城市列表：{by_city['城市'].unique().tolist()}")
+        st.info(f"已配置区位的城市：{list(城市_COORDS.keys())[:10]}...")
+        return
+    
+    # 准备园区地点数据：收集所有园区的位置信息（在创建图表之前）
+    park_locations = []
+    for park in df["园区"].dropna().unique():
+        if park in 园区_TO_城市:
+            city = 园区_TO_城市[park]
+            if city in 城市_COORDS:
+                lon, lat = 城市_COORDS[city]
+                # 统计该园区的项目数
+                park_count = len(df[df["园区"] == park])
+                park_locations.append((park, lon, lat, park_count))
+    
+    # 悬浮详情：园区名称、园区上报项目总数、园区总预算；城市级汇总（JS 中用 [] 访问中文键）
+    tooltip_js = JsCode(
+        """
+        function(params) {
+            var name = params.name;
+            var value = params.value;
+            var n = (value && value[2]) != null ? value[2] : (value || 0);
+            var info = typeof window.MAP_TOOLTIP_DATA !== 'undefined' && window.MAP_TOOLTIP_DATA[name];
+            if (info) {
+                var s = '<div style="text-align:left; min-width:200px;">';
+                s += '<b>' + name + '</b><br/>';
+                s += '项目总数：' + (info['项目总数'] || n) + ' 项<br/>';
+                s += '总预算：' + (info['总预算万元'] || 0) + ' 万元<br/>';
+                s += '<hr style="margin:6px 0;"/>';
+                s += '各园区：<br/>';
+                var list = info['园区列表'] || [];
+                for (var i = 0; i < list.length; i++) {
+                    var p = list[i];
+                    s += '· ' + (p['园区名称'] || '') + '｜' + (p['项目数'] || 0) + ' 项｜' + (p['预算万元'] || 0) + ' 万<br/>';
+                }
+                s += '</div>';
+                return s;
+            }
+            return name + '<br/>项目数：' + n + ' 项';
+        }
+        """
+    )
+    
+    # 使用Geo图表（支持同时显示地图和园区位置散点）
+    geo = Geo(init_opts=opts.InitOpts(width="100%", height="500px", theme="light", renderer="canvas"))
+    geo.add_schema(maptype="china", is_roam=True)
+    # 添加所有城市坐标
+    for city, (lon, lat) in 城市_COORDS.items():
+        geo.add_coordinate(city, lon, lat)
+    # 添加城市项目数散点图（使用effectScatter效果更明显）
+    geo.add(
+        "项目数",
+        data,
+        type_="effectScatter",
+        symbol_size=14,
+        effect_opts=opts.EffectOpts(scale=4, brush_type="stroke"),
+        label_opts=opts.LabelOpts(is_show=True, formatter="{b}", font_size=11),
+    )
+    # 添加园区地点标记（红色散点）
+    if park_locations:
+        # 为每个园区添加坐标
+        for park_name, lon, lat, park_count in park_locations:
+            geo.add_coordinate(park_name, lon, lat)
+        # 添加园区散点图
+        park_data = [(park_name, park_count) for park_name, lon, lat, park_count in park_locations]
+        geo.add(
+            "园区位置",
+            park_data,
+            type_="scatter",
+            symbol_size=10,
+            itemstyle_opts=opts.ItemStyleOpts(color="#ff6b6b"),
+            label_opts=opts.LabelOpts(is_show=True, formatter="{b}", font_size=9, position="right"),
+        )
+    # 设置全局选项
+    geo.set_global_opts(
+        title_opts=opts.TitleOpts(title="各地市项目分布（点击城市可筛选下方详情）", pos_left="center"),
+        tooltip_opts=opts.TooltipOpts(trigger="item", formatter=tooltip_js),
+        visualmap_opts=opts.VisualMapOpts(
+            min_=min(d[1] for d in data),
+            max_=max(d[1] for d in data),
+            is_piecewise=False,
+            pos_left="left",
+            range_color=["#e0f3f8", "#0868ac"],
+        ),
+    )
+    
+    # 如果数据为空，显示备用信息
+    if not data:
+        st.warning("暂无地图数据可显示")
+        # 显示城市列表作为备用
+        if not by_city.empty:
+            st.dataframe(by_city[["城市", "项目数", "金额合计"]], use_container_width=True, hide_index=True)
+        return
+    
+    # 尝试使用pyecharts
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False, encoding="utf-8") as f:
+            geo.render(f.name)
+            html_path = f.name
+        
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        
+        # 检查HTML是否生成成功
+        if not html or len(html) < 100:
+            st.error("地图HTML生成失败，请检查pyecharts安装是否正确。")
+            st.info("提示：可能需要安装地图数据包：pip install echarts-china-provinces-pypkg echarts-china-cities-pypkg")
+            # 显示备用表格
+            if not by_city.empty:
+                st.dataframe(by_city[["城市", "项目数", "金额合计"]], use_container_width=True, hide_index=True)
+            return
+        
+        # 检查HTML中是否包含echarts相关代码
+        if "echarts" not in html.lower() and "echart" not in html.lower():
+            st.warning("生成的HTML中未找到echarts相关代码，地图可能无法正常显示。")
+            st.info("提示：可能需要安装地图数据包：pip install echarts-china-provinces-pypkg echarts-china-cities-pypkg")
+            if not by_city.empty:
+                st.dataframe(by_city[["城市", "项目数", "金额合计"]], use_container_width=True, hide_index=True)
+            return
+        
+        # 注入 tooltip 数据与点击跳转：悬浮用 MAP_TOOLTIP_DATA，点击后带 ?selected_city= 刷新并定位下方
+        import json
+        tooltip_json = json.dumps(city_tooltip_data, ensure_ascii=False)
+        inject = (
+            "<script>\n"
+            "window.MAP_TOOLTIP_DATA = " + tooltip_json + ";\n"
+            "function attachMapClick() {\n"
+            "  var dom = document.querySelector('[id^=\"_\"]');\n"
+            "  if (dom && window.echarts) {\n"
+            "    var inst = window.echarts.getInstanceByDom(dom);\n"
+            "    if (inst && !inst._mapClickAttached) {\n"
+            "      inst._mapClickAttached = true;\n"
+            "      inst.on('click', function(params) {\n"
+            "        if (params && params.name) {\n"
+            "          var u = window.top.location.pathname || '/';\n"
+            "          var q = 'selected_city=' + encodeURIComponent(params.name);\n"
+            "          window.top.location.href = u + (u.indexOf('?')>=0 ? '&' : '?') + q;\n"
+            "        }\n"
+            "      });\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "if (document.readyState === 'complete') { setTimeout(attachMapClick, 300); }\n"
+            "else { document.addEventListener('DOMContentLoaded', function() { setTimeout(attachMapClick, 300); }); }\n"
+            "</script>\n"
+        )
+        # pyecharts 渲染的图表在 div 内，在 body 末尾插入 script
+        if "</body>" in html:
+            html = html.replace("</body>", inject + "</body>")
+        else:
+            html = html + inject
+        
+        # 显示地图
+        st.info("使用pyecharts地图显示")
+        st.components.v1.html(html, height=450, scrolling=False)
+        
+    except Exception as e:
+        error_msg = str(e)
+        st.error(f"pyecharts地图渲染出错：{error_msg}")
+        st.info("已在上方显示Streamlit原生地图作为备用方案")
+        st.info("如需使用pyecharts地图，请检查：")
+        st.info("1) pyecharts是否正确安装：pip install pyecharts")
+        st.info("2) 是否安装了地图数据包：pip install echarts-china-provinces-pypkg echarts-china-cities-pypkg")
+        st.info("3) 数据是否包含城市信息")
+        
+        # 显示详细错误信息（仅在开发模式下）
+        if st.checkbox("显示详细错误信息（调试用）", value=False):
+            import traceback
+            st.code(traceback.format_exc())
+        
+        # 显示数据表格作为备用
+        if not by_city.empty:
+            st.markdown("### 城市项目统计（表格视图）")
+            st.dataframe(by_city[["城市", "项目数", "金额合计"]].sort_values("项目数", ascending=False), 
+                        use_container_width=True, hide_index=True)
+    finally:
+        try:
+            if 'html_path' in locals():
+                Path(html_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _render_图表_简易(sub: pd.DataFrame):
     """无 plotly 时的简易柱状图回退。"""
     c1, c2 = st.columns(2)
@@ -4763,7 +5006,7 @@ def generate_pdf_report(df: pd.DataFrame, 园区选择: list, output_path: str =
 
 
 def render_地图与统计(df: pd.DataFrame, 园区选择: list):
-    """统计 Tab：按专业/分级/园区/区域图表。"""
+    """地图与统计 Tab：中国地图 + 按专业/分级/园区/区域图表。"""
     df_with_location = _add_城市和区域列(df)
     # 处理园区选择：如果为空或None，显示所有有园区信息的数据
     if 园区选择 and len(园区选择) > 0:
@@ -4775,6 +5018,12 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
     else:
         sub = df_with_location[df_with_location["园区"].notna()]  # 只显示有园区信息的行
 
+    st.subheader("中国地图 · 各地市项目分布")
+    # 为地图构造城市-园区明细，用于 tooltip 展示
+    city_tooltip_data = _build_城市_园区明细(sub)
+    _render_中国地图(sub, city_tooltip_data)
+    
+    st.markdown("---")
     st.subheader("数据统计")
     st.markdown("### 📊 按区域统计分析")
     
