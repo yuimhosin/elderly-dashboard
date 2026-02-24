@@ -265,10 +265,13 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
     selected_profs = []
     selected_prof_subcontracts = []
 
-    if show_region and "所属区域" in sub.columns:
+    # 用于级联下钻的临时 DataFrame：每选择一层，就用该层结果作为下一层可选值的来源
+    sub_for_opts = sub.copy()
+
+    if show_region and "所属区域" in sub_for_opts.columns:
         with col_region:
             region_opts = (
-                sub["所属区域"]
+                sub_for_opts["所属区域"]
                 .dropna()
                 .astype(str)
                 .replace("其他", pd.NA)
@@ -282,11 +285,13 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
                 options=region_opts,
                 help="例如：只看华东地区时，勾选「华东」。可多选。",
             )
+            if selected_regions:
+                sub_for_opts = sub_for_opts[sub_for_opts["所属区域"].isin(selected_regions)]
 
-    if show_level_stats and "项目分级" in sub.columns:
+    if show_level_stats and "项目分级" in sub_for_opts.columns:
         with col_level:
             level_opts = (
-                sub["项目分级"]
+                sub_for_opts["项目分级"]
                 .dropna()
                 .astype(str)
                 .unique()
@@ -298,12 +303,14 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
                 options=level_opts,
                 help="例如：只看一级项目时，勾选「一级」。可多选。",
             )
+            if selected_levels:
+                sub_for_opts = sub_for_opts[sub_for_opts["项目分级"].isin(selected_levels)]
 
-    if use_amount_filter and "拟定金额" in sub.columns:
+    if use_amount_filter and "拟定金额" in sub_for_opts.columns:
         with col_amount:
             try:
-                min_val = float(sub["拟定金额"].min() or 0)
-                max_val = float(sub["拟定金额"].max() or 0)
+                min_val = float(sub_for_opts["拟定金额"].min() or 0)
+                max_val = float(sub_for_opts["拟定金额"].max() or 0)
             except Exception:
                 min_val, max_val = 0.0, 0.0
             if max_val < min_val:
@@ -322,9 +329,14 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
                 )
 
     # 其他标签字段的多选筛选
-    if show_business_type and "项目业态" in sub.columns:
+    if use_amount_filter and amount_min is not None and amount_max is not None and "拟定金额" in sub_for_opts.columns:
+        sub_for_opts = sub_for_opts[
+            (sub_for_opts["拟定金额"] >= amount_min) & (sub_for_opts["拟定金额"] <= amount_max)
+        ]
+
+    if show_business_type and "项目业态" in sub_for_opts.columns:
         business_opts = (
-            sub["项目业态"]
+            sub_for_opts["项目业态"]
             .dropna()
             .astype(str)
             .unique()
@@ -337,9 +349,12 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             help="例如：只看某一业态的项目时，在此勾选对应业态。",
         )
 
-    if show_category and "项目分类" in sub.columns:
+        if selected_business_types:
+            sub_for_opts = sub_for_opts[sub_for_opts["项目业态"].isin(selected_business_types)]
+
+    if show_category and "项目分类" in sub_for_opts.columns:
         category_opts = (
-            sub["项目分类"]
+            sub_for_opts["项目分类"]
             .dropna()
             .astype(str)
             .unique()
@@ -352,9 +367,12 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             help="例如：只看某一类项目时，在此勾选对应分类。",
         )
 
-    if show_contractor and "拟定承建组织" in sub.columns:
+        if selected_categories:
+            sub_for_opts = sub_for_opts[sub_for_opts["项目分类"].isin(selected_categories)]
+
+    if show_contractor and "拟定承建组织" in sub_for_opts.columns:
         contractor_opts = (
-            sub["拟定承建组织"]
+            sub_for_opts["拟定承建组织"]
             .dropna()
             .astype(str)
             .unique()
@@ -367,9 +385,12 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             help="例如：只看由某个承建组织负责的项目时，在此勾选对应承建组织。",
         )
 
-    if show_focus and "总部重点关注项目" in sub.columns:
+        if selected_contractors:
+            sub_for_opts = sub_for_opts[sub_for_opts["拟定承建组织"].isin(selected_contractors)]
+
+    if show_focus and "总部重点关注项目" in sub_for_opts.columns:
         focus_opts = (
-            sub["总部重点关注项目"]
+            sub_for_opts["总部重点关注项目"]
             .dropna()
             .astype(str)
             .unique()
@@ -382,9 +403,12 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             help="例如：只看总部重点关注的项目时，在此勾选「是」或对应标记。",
         )
 
-    if show_prof and "专业" in sub.columns:
+        if selected_focus:
+            sub_for_opts = sub_for_opts[sub_for_opts["总部重点关注项目"].isin(selected_focus)]
+
+    if show_prof and "专业" in sub_for_opts.columns:
         prof_opts = (
-            sub["专业"]
+            sub_for_opts["专业"]
             .dropna()
             .astype(str)
             .unique()
@@ -397,9 +421,12 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
             help="例如：只看电梯系统或供配电系统等某几个专业。",
         )
 
-    if show_prof_subcontract and ("专业分包" in sub.columns or "专业细分" in sub.columns):
-        col_name = "专业分包" if "专业分包" in sub.columns else "专业细分"
-        sub_prof = sub[col_name].dropna().astype(str)
+        if selected_profs:
+            sub_for_opts = sub_for_opts[sub_for_opts["专业"].isin(selected_profs)]
+
+    if show_prof_subcontract and ("专业分包" in sub_for_opts.columns or "专业细分" in sub_for_opts.columns):
+        col_name = "专业分包" if "专业分包" in sub_for_opts.columns else "专业细分"
+        sub_prof = sub_for_opts[col_name].dropna().astype(str)
         prof_sub_opts = sorted(sub_prof.unique().tolist())
         selected_prof_subcontracts = st.multiselect(
             "选择专业分包",
