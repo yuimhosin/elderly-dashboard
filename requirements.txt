@@ -4,5 +4,3 @@ reportlab
 plotly
 openpyxl>=3.0.0
 pyecharts
-echarts-china-provinces-pypkg
-echarts-china-cities-pypkg
