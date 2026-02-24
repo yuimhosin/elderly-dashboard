@@ -5254,22 +5254,75 @@ def main():
             else:
                 st.warning("请填写有效目录路径")
 
-        # 侧边栏：手动录入数据（按源数据CSV格式）
+        # 侧边栏：手动录入数据（按固定字段顺序，无需列名）
         st.markdown("----")
+        manual_help = (
+            "一行一条记录，用英文逗号分隔字段，不需要列名。\n\n"
+            "字段顺序严格为：\n"
+            "1) 社区（园区，例如：燕园）\n"
+            "2) 项目名称（例如：燕园1号楼电梯更换）\n"
+            "3) 项目分级（例如：一级/二级/三级）\n"
+            "4) 专业（例如：电梯系统/供配电系统等）\n"
+            "5) 拟定金额（万元，数字，如：120 或 120.5）\n"
+            "6) 拟定承建组织（可留空）\n"
+            "7) 需求立项日期（可留空，如：2025-01-15）\n"
+            "8) 验收日期（可留空，如：2025-03-20）\n\n"
+            "示例：\n"
+            "燕园, 燕园1号楼电梯更换, 一级, 电梯系统, 120, XX工程公司, 2025-01-15, 2025-03-20\n"
+            "蜀园, 蜀园供配电系统改造, 二级, 供配电系统, 80, , 2025-02-01, \n\n"
+            "说明：\n"
+            "- 序号字段系统会自动生成，无需填写；\n"
+            "- 所属区域和城市将根据社区名称自动识别；\n"
+            "- 多条记录请分别写在多行。"
+        )
         manual_text = st.text_area(
-            "手动输入数据（CSV 格式）",
+            "手动输入数据（按固定字段顺序）",
             value=st.session_state.get("manual_text", ""),
-            help="请输入与源数据相同表头的CSV文本（第一行为列名，后续为数据行），如需追加多行请按换行分隔。",
+            help=manual_help,
         )
         st.session_state["manual_text"] = manual_text
         if manual_text.strip():
             try:
-                manual_df = pd.read_csv(io.StringIO(manual_text.strip()))
-                if not manual_df.empty:
-                    st.success(f"已从手动输入加载 {len(manual_df)} 条记录，这些记录会参与下方所有统计。")
+                lines = [ln.strip() for ln in manual_text.strip().splitlines() if ln.strip()]
+                rows = []
+                # 计算当前数据中已有的最大序号，用于续编号
+                current_max_seq = 0
+                if not df.empty and "序号" in df.columns:
+                    try:
+                        current_max_seq = int(pd.to_numeric(df["序号"], errors="coerce").max() or 0)
+                    except Exception:
+                        current_max_seq = 0
+                seq = current_max_seq
+                value_cols = ["园区", "项目名称", "项目分级", "专业", "拟定金额", "拟定承建组织", "需求立项", "验收(社区需求完成交付)"]
+                for line in lines:
+                    # 支持中英文逗号
+                    parts = [p.strip() for p in line.replace("，", ",").split(",")]
+                    if not any(parts):
+                        continue
+                    # 补齐或截断到固定列数
+                    if len(parts) < len(value_cols):
+                        parts += [""] * (len(value_cols) - len(parts))
+                    else:
+                        parts = parts[: len(value_cols)]
+                    seq += 1
+                    row = {"序号": seq}
+                    for col, val in zip(value_cols, parts):
+                        if col == "拟定金额":
+                            try:
+                                row[col] = float(val) if val not in ("", None) else 0
+                            except Exception:
+                                row[col] = 0
+                        else:
+                            row[col] = val
+                    rows.append(row)
+                if rows:
+                    manual_df = pd.DataFrame(rows)
+                    st.success(f"已从手动输入加载 {len(manual_df)} 条记录（序号已自动生成），这些记录会参与下方所有统计。")
+                else:
+                    manual_df = pd.DataFrame()
             except Exception as e:
                 manual_df = pd.DataFrame()
-                st.error("手动输入数据解析失败，请确认为标准CSV格式（逗号分隔，首行为表头）。")
+                st.error("手动输入数据解析失败，请检查每行是否为 8 个用逗号分隔的字段，且至少包含社区和项目名称。")
 
         # 侧边栏：自定义数据输入框（文本）
         st.markdown("---")
