@@ -5193,7 +5193,13 @@ def main():
         st.header("数据源")
         source = st.radio("数据来源", ["单文件", "目录下全部 CSV"], index=0)
         df = pd.DataFrame()
+        manual_df = pd.DataFrame()
         if source == "单文件":
+            update_backend = st.checkbox(
+                "上传CSV后同时更新后台默认数据文件",
+                value=False,
+                help="勾选后，上传的CSV会覆盖当前目录下的默认数据文件（改良改造报表-V4.csv），用于后续所有访问。",
+            )
             uploaded = st.file_uploader(
                 "上传 CSV 或 Excel 文件",
                 type=["csv", "xlsx", "xls"],
@@ -5213,6 +5219,16 @@ def main():
                         st.warning("文件已解析但未找到有效数据行。请确认：表头为两行，且含「序号」「项目分级」「专业」「拟定金额」等列。")
                     else:
                         st.success(f"已加载：{name}，共 {len(df)} 条记录")
+                        # 可选：将上传的 CSV 持久化为默认数据源，便于下次直接使用（需勾选开关）
+                        if suffix == ".csv" and update_backend:
+                            try:
+                                target_path = Path(DEFAULT_SINGLE_FILE)
+                                target_path.write_bytes(uploaded.getvalue())
+                                st.info(f"已将上传的CSV保存为默认数据源：{target_path.name}，后端数据已更新。")
+                            except Exception as e_save:
+                                st.warning(f"上传文件已加载，但保存到服务器失败：{e_save}")
+                        elif suffix != ".csv":
+                            st.info("当前上传的是 Excel 文件，仅在本次会话中使用，未覆盖默认CSV文件。")
                 except Exception as e:
                     st.error(f"解析失败：{e}")
                     import traceback
@@ -5237,6 +5253,39 @@ def main():
                     st.error(f"加载失败：{e}")
             else:
                 st.warning("请填写有效目录路径")
+
+        # 侧边栏：手动录入数据（按源数据CSV格式）
+        st.markdown("----")
+        manual_text = st.text_area(
+            "手动输入数据（CSV 格式）",
+            value=st.session_state.get("manual_text", ""),
+            help="请输入与源数据相同表头的CSV文本（第一行为列名，后续为数据行），如需追加多行请按换行分隔。",
+        )
+        st.session_state["manual_text"] = manual_text
+        if manual_text.strip():
+            try:
+                manual_df = pd.read_csv(io.StringIO(manual_text.strip()))
+                if not manual_df.empty:
+                    st.success(f"已从手动输入加载 {len(manual_df)} 条记录，这些记录会参与下方所有统计。")
+            except Exception as e:
+                manual_df = pd.DataFrame()
+                st.error("手动输入数据解析失败，请确认为标准CSV格式（逗号分隔，首行为表头）。")
+
+        # 侧边栏：自定义数据输入框（文本）
+        st.markdown("---")
+        custom_note = st.text_area(
+            "补充说明 / 备注（可选）",
+            value=st.session_state.get("custom_note", ""),
+            help="可在此输入本次数据的备注说明、使用范围等信息，仅作为展示，不参与计算。",
+        )
+        st.session_state["custom_note"] = custom_note
+
+        # 合并文件/目录数据与手动输入数据
+        if not manual_df.empty:
+            if not df.empty:
+                df = pd.concat([df, manual_df], ignore_index=True)
+            else:
+                df = manual_df
 
         if not df.empty:
             # 过滤掉 None 和空值，但保留其他值
@@ -5338,18 +5387,12 @@ def main():
     
     render_审核流程说明()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["项目统计分析", "统计", "地区分析", "各园区分级分类", "总部视图", "全部项目"])
+    tab1, tab2, tab3 = st.tabs(["项目统计分析", "地图与统计", "全部项目"])
     with tab1:
         render_项目统计分析(df, 园区选择)
     with tab2:
         render_地图与统计(df, 园区选择)
     with tab3:
-        render_地区分析(df, 园区选择)
-    with tab4:
-        render_园区分级分类(df, 园区选择)
-    with tab5:
-        render_总部视图(df, 园区选择)
-    with tab6:
         st.subheader("全部项目清单")
         st.caption(f"共 {len(df)} 条项目，以下列出所有项目明细。")
         # 显示时包含城市和区域列
