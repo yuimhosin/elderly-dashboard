@@ -5378,10 +5378,28 @@ def generate_pdf_report(df: pd.DataFrame, 园区选择: list, output_path: str =
     return generate_pdf_report_html(df, 园区选择, output_path)
 
 
+def _get_deepseek_api_key(provided: str | None = None) -> str | None:
+    """获取 DeepSeek API Key：优先使用传入值，否则 session_state、Streamlit Secrets、环境变量。"""
+    if provided and str(provided).strip():
+        return str(provided).strip()
+    key = st.session_state.get("deepseek_api_key") or ""
+    if key and str(key).strip():
+        return str(key).strip()
+    # Streamlit Secrets：键不存在时会抛错，需 try/except；TOML 中键名可用大写或小写
+    if hasattr(st, "secrets") and st.secrets:
+        for secret_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
+            try:
+                val = st.secrets[secret_key]
+                if val and str(val).strip():
+                    return str(val).strip()
+            except (KeyError, AttributeError, TypeError):
+                continue
+    return os.getenv("DEEPSEEK_API_KEY") or None
+
+
 def _get_deepseek_client(api_key: str | None = None):
-    """构造 DeepSeek 客户端，优先使用环境变量 DEEPSEEK_API_KEY。"""
-    env_key = os.getenv("DEEPSEEK_API_KEY")
-    final_key = api_key or env_key
+    """构造 DeepSeek 客户端，API Key 来自参数或 _get_deepseek_api_key。"""
+    final_key = api_key or _get_deepseek_api_key()
     if not (DEEPSEEK_CLIENT_AVAILABLE and final_key):
         return None
     try:
@@ -6085,17 +6103,18 @@ def main():
         st.subheader("AI 助手（DeepSeek 驱动）")
         st.markdown(
             """
-            这个 AI 窗口用于：\n
-            - 解答本网页的 **使用说明**（如如何上传数据、如何手动录入、各个标签页含义等）；\n
-            - 帮你根据当前已加载的数据给出 **查询与筛选的建议**（例如：“帮我查找三月立项的项目”）。\n\n
-            使用方式：\n
-            - 请在运行环境中设置环境变量 `DEEPSEEK_API_KEY`，例如：\n
-              - Windows PowerShell: `$env:DEEPSEEK_API_KEY=\"你的密钥\"`\n
-              - Linux / macOS: `export DEEPSEEK_API_KEY=\"你的密钥\"`\n
-            - 设置完成后，无需在页面内输入密钥，直接在下方对话框提问即可。
+            这个 AI 窗口用于：**使用说明**、**查询与筛选建议**（如“帮我查找三月立项的项目”）。  
+            请在下方填写 DeepSeek API Key 后即可对话（仅存于当前会话，不会上传）。
             """
         )
-        api_key = os.getenv("DEEPSEEK_API_KEY")
+        st.text_input(
+            "DeepSeek API Key",
+            type="password",
+            placeholder="sk-...（可从 https://platform.deepseek.com 获取）",
+            help="填写后即可使用。Secrets：在项目根目录建 .streamlit/secrets.toml，内容写 DEEPSEEK_API_KEY = \"sk-xxx\"，然后重启 Streamlit。",
+            key="deepseek_api_key",
+        )
+        api_key = _get_deepseek_api_key()
 
         if "ai_messages" not in st.session_state:
             st.session_state["ai_messages"] = [
