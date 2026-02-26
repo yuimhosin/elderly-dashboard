@@ -5861,7 +5861,21 @@ def main():
 
         if source == "数据库（团队共享）":
             if df_db.empty:
-                st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
+                # 若默认 CSV（改良改造报表-V4.csv）存在，则用其初始化团队共享数据库
+                default_csv = Path(DEFAULT_SINGLE_FILE)
+                if default_csv.exists():
+                    try:
+                        df = load_single_csv(str(default_csv))
+                        if not df.empty:
+                            save_to_db(df)
+                            st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。")
+                        else:
+                            st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
+                    except Exception as e:
+                        st.warning(f"无法从默认 CSV 加载：{e}。请通过下方“上传文件”导入。")
+                        df = pd.DataFrame()
+                else:
+                    st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
             else:
                 st.success(f"已从数据库加载，共 {len(df_db)} 条记录（所有用户共享）。")
                 df = df_db
