@@ -171,34 +171,21 @@ def _get_next_序号(df: pd.DataFrame) -> int:
 
 # ---------- 飞书推送（自定义机器人 Webhook）----------
 def _get_feishu_webhook_url() -> str | None:
-    """获取飞书 Webhook URL：Secrets/环境变量优先（保证部署后能推送），再读侧栏输入。"""
-    # 1) Secrets（.streamlit/secrets.toml 或 Cloud 里 feishu_webhook_url）
+    """获取飞书 Webhook URL：Streamlit Secrets > 环境变量 FEISHU_WEBHOOK_URL。"""
     try:
         if hasattr(st, "secrets") and st.secrets:
             for key in ("FEISHU_WEBHOOK_URL", "feishu_webhook_url"):
-                v = None
                 try:
                     v = st.secrets[key]
+                    if v and str(v).strip().startswith("https://"):
+                        return str(v).strip()
                 except (KeyError, AttributeError, TypeError):
-                    pass
-                if v is None and hasattr(st.secrets, key):
-                    v = getattr(st.secrets, key, None)
-                if v and str(v).strip().startswith("https://"):
-                    return str(v).strip()
+                    continue
     except FileNotFoundError:
         pass
     except Exception:
         pass
-    # 2) 环境变量
-    for env_key in ("FEISHU_WEBHOOK_URL", "feishu_webhook_url"):
-        env_url = os.getenv(env_key)
-        if env_url and str(env_url).strip().startswith("https://"):
-            return str(env_url).strip()
-    # 3) 侧栏输入
-    url = (st.session_state.get("feishu_webhook_url") or "").strip()
-    if url and url.startswith("https://"):
-        return url
-    return None
+    return os.getenv("FEISHU_WEBHOOK_URL") or None
 
 
 def _to_json_value(v):
@@ -397,14 +384,6 @@ def push_to_feishu(text: str | None = None, payload: dict | None = None) -> bool
     return False
 
 
-@st.cache_data(ttl=300)
-def load_data(source_type: str, path_or_dir: str, pattern: str = "*.csv") -> pd.DataFrame:
-    """根据数据源类型加载数据。"""
-    if source_type == "单文件":
-        return load_single_csv(path_or_dir)
-    return load_from_directory(path_or_dir, pattern)
-
-
 def render_审核流程说明():
     """审核流程说明区块。"""
     st.markdown("### 📋 需求审核与实施流程说明")
@@ -421,97 +400,6 @@ def render_审核流程说明():
     for title, desc in steps:
         st.markdown(f"- **{title}**：{desc}")
     st.divider()
-
-
-def render_园区分级分类(df: pd.DataFrame, 园区选择: list):
-    """各园区分级、专业分类统计与明细。"""
-    st.subheader("各园区分级分类统计")
-    # 处理园区选择：如果为空或None，显示所有数据；否则按选择筛选
-    if 园区选择 and len(园区选择) > 0:
-        # 过滤掉 None 值
-        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
-        if valid_parks:
-            sub = df[df["园区"].isin(valid_parks)]
-        else:
-            sub = df[df["园区"].notna()]
-    else:
-        sub = df[df["园区"].notna()]  # 只显示有园区信息的行
-
-    # 检查是否有专业分包列
-    has_prof_subcontract = "专业分包" in sub.columns or "专业细分" in sub.columns
-    prof_subcontract_col = "专业分包" if "专业分包" in sub.columns else ("专业细分" if "专业细分" in sub.columns else None)
-    
-    if has_prof_subcontract:
-        c1, c2, c3, c4 = st.columns(4)
-    else:
-        c1, c2, c3 = st.columns(3)
-    
-    with c1:
-        by_level = sub.groupby("项目分级", dropna=False).agg(
-            项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
-        ).reset_index()
-        st.markdown("**按紧急程度（分级）**")
-        st.dataframe(by_level, use_container_width=True, hide_index=True)
-    with c2:
-        by_prof = sub.groupby("专业", dropna=False).agg(
-            项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
-        ).reset_index()
-        # 过滤掉"其它系统"分类
-        by_prof = by_prof[~by_prof["专业"].isin(["其它系统", "其他系统"])]
-        st.markdown("**按专业分类**")
-        st.dataframe(by_prof, use_container_width=True, hide_index=True)
-    with c3:
-        by_park = sub.groupby("园区", dropna=False).agg(
-            项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
-        ).reset_index()
-        st.markdown("**按园区**")
-        st.dataframe(by_park, use_container_width=True, hide_index=True)
-    
-    if has_prof_subcontract:
-        with c4:
-            by_prof_subcontract = sub.groupby(prof_subcontract_col, dropna=False).agg(
-                项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
-            ).reset_index()
-            st.markdown("**按专业分包**")
-            st.dataframe(by_prof_subcontract, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    st.markdown("**全部项目清单（可筛选）**")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        level_filter = st.multiselect("按分级筛选", options=sub["项目分级"].dropna().unique().tolist(), default=None)
-    with col2:
-        prof_filter = st.multiselect("按专业筛选", options=sub["专业"].dropna().unique().tolist(), default=None)
-    with col3:
-        if has_prof_subcontract:
-            prof_subcontract_filter = st.multiselect("按专业分包筛选", options=sub[prof_subcontract_col].dropna().unique().tolist(), default=None)
-        else:
-            prof_subcontract_filter = None
-    
-    detail = sub.copy()
-    if level_filter:
-        detail = detail[detail["项目分级"].isin(level_filter)]
-    if prof_filter:
-        detail = detail[detail["专业"].isin(prof_filter)]
-    if prof_subcontract_filter and has_prof_subcontract:
-        detail = detail[detail[prof_subcontract_col].isin(prof_subcontract_filter)]
-    st.caption(f"共 {len(detail)} 条项目")
-    # 为避免不同表头字段缺失导致 KeyError，这里按实际存在的列进行展示
-    base_cols = ["园区", "序号", "项目分级", "项目分类", "专业", "项目名称", "拟定金额"]
-    optional_cols = ["拟定承建组织", "需求立项", "验收", "验收(社区需求完成交付)"]
-    cols_to_show = [c for c in base_cols + optional_cols if c in detail.columns]
-    if not cols_to_show:
-        st.dataframe(detail, use_container_width=True, hide_index=True)
-    else:
-        df_show = detail[cols_to_show].copy()
-        # 统一验收列名称，优先使用「验收(社区需求完成交付)」
-        if "验收" in df_show.columns and "验收(社区需求完成交付)" not in df_show.columns:
-            df_show = df_show.rename(columns={"验收": "验收(社区需求完成交付)"})
-        st.dataframe(df_show, use_container_width=True, hide_index=True)
 
 
 def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
@@ -1742,83 +1630,6 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         st.info("未找到立项日期列，无法进行月份统计。")
 
 
-def render_总部视图(df: pd.DataFrame, 园区选择: list):
-    """总部视图：各园区稳定需求数量与金额、施工进展、验收时间预告。"""
-    st.subheader("总部视图：稳定需求与施工验收")
-    # 处理园区选择：如果为空或None，显示所有有园区信息的数据
-    if 园区选择 and len(园区选择) > 0:
-        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
-        if valid_parks:
-            sub = df[df["园区"].isin(valid_parks)]
-        else:
-            sub = df[df["园区"].notna()]
-    else:
-        sub = df[df["园区"].notna()]  # 只显示有园区信息的行
-
-    stable_mask = get_稳定需求_mask(sub)
-    stable = sub[stable_mask]
-
-    st.markdown("#### 各园区已确定稳定需求数量与金额")
-    summary = stable.groupby("园区", dropna=False).agg(
-        稳定需求数量=("序号", "count"),
-        稳定需求金额=("拟定金额", "sum"),
-    ).reset_index()
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("稳定需求项目数", int(stable["序号"].count()))
-    with col2:
-        st.metric("稳定需求金额合计（万元）", f"{stable['拟定金额'].sum():.0f}")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    st.markdown("#### 施工进展与验收时间预告")
-    # 验收列
-    accept_col = "验收"
-    if accept_col not in sub.columns:
-        for c in sub.columns:
-            if "验收" in str(c):
-                accept_col = c
-                break
-    impl_col = "实施"
-    if impl_col not in sub.columns:
-        impl_col = [c for c in sub.columns if "实施" in str(c)]
-        impl_col = impl_col[0] if impl_col else None
-
-    preview = sub[["园区", "序号", "项目名称", "拟定金额", "拟定承建组织"]].copy()
-    preview["实施时间"] = sub[impl_col] if impl_col and impl_col in sub.columns else ""
-    preview["验收时间"] = sub[accept_col] if accept_col in sub.columns else ""
-    # 过滤无效日期
-    def valid_date(s):
-        if pd.isna(s): return False
-        t = str(s).strip()
-        if not t or t.startswith("-") or "1900" in t: return False
-        return True
-    preview["验收有效"] = preview["验收时间"].map(valid_date)
-    st.dataframe(preview, use_container_width=True, hide_index=True)
-
-    st.markdown("**验收时间预告（仅含有效日期）**")
-    accept_preview = preview[preview["验收有效"]].copy()
-    if accept_preview.empty:
-        st.info("暂无有效验收日期，请在一线填报「验收(社区需求完成交付)」节点。")
-    else:
-        accept_preview = accept_preview.sort_values("验收时间").drop(columns=["验收有效"])
-        st.dataframe(accept_preview, use_container_width=True, hide_index=True)
-
-
-def _add_城市列(df: pd.DataFrame) -> pd.DataFrame:
-    """为 df 增加「城市」列（根据园区映射），不修改原表。"""
-    out = df.copy()
-    out["城市"] = out["园区"].map(园区_TO_城市).fillna("其他")
-    return out
-
-
-def _add_区域列(df: pd.DataFrame) -> pd.DataFrame:
-    """为 df 增加「所属区域」列（根据园区映射），不修改原表。"""
-    out = df.copy()
-    out["所属区域"] = out["园区"].map(园区_TO_区域).fillna("其他")
-    return out
-
-
 def _add_城市和区域列(df: pd.DataFrame) -> pd.DataFrame:
     """为 df 同时增加「城市」和「所属区域」列，不修改原表。"""
     out = df.copy()
@@ -2087,248 +1898,6 @@ def _render_图表_简易(sub: pd.DataFrame):
     by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("拟定金额", "sum")).reset_index().sort_values("金额", ascending=False)
     if not by_prof_m.empty:
         st.bar_chart(by_prof_m.set_index("专业")["金额"])
-
-
-def render_地区分析(df: pd.DataFrame, 园区选择: list):
-    """地区分析模块：按所属区域进行详细统计分析。"""
-    df_with_location = _add_城市和区域列(df)
-    # 处理园区选择：如果为空或None，显示所有有园区信息的数据
-    if 园区选择 and len(园区选择) > 0:
-        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
-        if valid_parks:
-            sub = df_with_location[df_with_location["园区"].isin(valid_parks)]
-        else:
-            sub = df_with_location[df_with_location["园区"].notna()]
-    else:
-        sub = df_with_location[df_with_location["园区"].notna()]  # 只显示有园区信息的行
-    
-    # 过滤掉汇总行
-    if "序号" in sub.columns:
-        sub = sub[sub["序号"].notna()]
-        sub = sub[~sub["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
-        sub = sub[pd.to_numeric(sub["序号"], errors='coerce').notna()]
-    
-    st.subheader("地区分析：按所属区域统计")
-    
-    if "所属区域" not in sub.columns:
-        st.warning("数据中未找到'所属区域'列，无法进行地区分析。")
-        return
-    
-    # 过滤掉"其他"区域
-    sub_region = sub[sub["所属区域"] != "其他"].copy()
-    
-    if sub_region.empty:
-        st.info("当前筛选条件下暂无有效的区域数据。")
-        return
-    
-    # 1. 区域总览统计
-    st.markdown("### 📊 区域总览")
-    region_summary = sub_region.groupby("所属区域", dropna=False).agg(
-        项目数=("序号", "count"),
-        金额合计=("拟定金额", "sum"),
-        园区数=("园区", "nunique"),
-        城市数=("城市", "nunique"),
-    ).reset_index().sort_values("项目数", ascending=False)
-    region_summary["金额合计"] = region_summary["金额合计"].round(2)
-    region_summary["平均项目金额"] = (region_summary["金额合计"] / region_summary["项目数"]).round(2)
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("总区域数", len(region_summary))
-    with col2:
-        st.metric("总项目数", int(region_summary["项目数"].sum()))
-    with col3:
-        st.metric("总金额（万元）", f"{region_summary['金额合计'].sum():,.0f}")
-    with col4:
-        st.metric("总园区数", int(region_summary["园区数"].sum()))
-    with col5:
-        st.metric("总城市数", int(region_summary["城市数"].sum()))
-    
-    st.markdown("#### 各区域统计汇总")
-    st.dataframe(region_summary, use_container_width=True, hide_index=True)
-    
-    # 2. 区域对比图表
-    st.markdown("---")
-    st.markdown("### 📈 区域对比分析")
-    
-    try:
-        import plotly.express as px
-        from plotly.subplots import make_subplots
-        import plotly.graph_objects as go
-        
-        st.markdown("**区域对比分析：项目数与金额**")
-        # 创建组合图表：使用 subplots 创建包含柱状图和饼图的组合
-        fig = make_subplots(
-            rows=2, cols=2,
-            subplot_titles=("各区域项目数对比", "各区域金额对比（万元）", "各区域金额分布（万元）", "各区域项目数分布"),
-            specs=[[{"type": "bar"}, {"type": "bar"}],
-                   [{"type": "pie"}, {"type": "pie"}]],
-            vertical_spacing=0.2,
-            horizontal_spacing=0.15
-        )
-        
-        colors_region = ["#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", "#98D8C8"]
-        colors = colors_region[:len(region_summary)]
-        
-        # 第一个子图：项目数柱状图
-        for i, (idx, row) in enumerate(region_summary.iterrows()):
-            fig.add_trace(
-                go.Bar(
-                    x=[row["所属区域"]],
-                    y=[row["项目数"]],
-                    name=row["所属区域"],
-                    marker_color=colors[i],
-                    text=[int(row["项目数"])],
-                    textposition="outside",
-                    showlegend=False
-                ),
-                row=1, col=1
-            )
-        
-        # 第二个子图：金额柱状图
-        for i, (idx, row) in enumerate(region_summary.iterrows()):
-            fig.add_trace(
-                go.Bar(
-                    x=[row["所属区域"]],
-                    y=[row["金额合计"]],
-                    name=row["所属区域"],
-                    marker_color=colors[i],
-                    text=[f"{row['金额合计']:.0f}"],
-                    textposition="outside",
-                    showlegend=False
-                ),
-                row=1, col=2
-            )
-        
-        # 第三个子图：金额分布饼图
-        fig.add_trace(
-            go.Pie(
-                labels=region_summary["所属区域"],
-                values=region_summary["金额合计"],
-                name="金额分布",
-                marker_colors=colors,
-                hole=0.4,
-                textinfo="label+percent+value",
-                texttemplate="%{label}<br>%{percent}<br>%{value:,.0f}万元",
-                showlegend=False
-            ),
-            row=2, col=1
-        )
-        
-        # 第四个子图：项目数分布饼图
-        fig.add_trace(
-            go.Pie(
-                labels=region_summary["所属区域"],
-                values=region_summary["项目数"],
-                name="项目数分布",
-                marker_colors=colors,
-                hole=0.4,
-                textinfo="label+percent+value",
-                texttemplate="%{label}<br>%{percent}<br>%{value}项",
-                showlegend=False
-            ),
-            row=2, col=2
-        )
-        
-        # 更新布局
-        fig.update_xaxes(title_text="所属区域", row=1, col=1, tickangle=0)
-        fig.update_yaxes(title_text="项目数", row=1, col=1)
-        fig.update_xaxes(title_text="所属区域", row=1, col=2, tickangle=0)
-        fig.update_yaxes(title_text="金额（万元）", row=1, col=2)
-        
-        fig.update_layout(
-            height=800,
-            showlegend=False,
-            margin=dict(t=80, b=50, l=50, r=50),
-            title_text="区域对比分析：项目数与金额统计",
-            title_x=0.5,
-            title_font_size=16
-        )
-        
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        
-    except ImportError:
-        st.warning("请安装 plotly 以使用美化图表：pip install plotly")
-        st.bar_chart(region_summary.set_index("所属区域")[["项目数", "金额合计"]])
-    
-    # 3. 各区域详细分析
-    st.markdown("---")
-    st.markdown("### 🔍 各区域详细分析")
-    
-    # 按区域分组展示
-    for region in sorted(region_summary["所属区域"].unique()):
-        region_df = sub_region[sub_region["所属区域"] == region]
-        
-        # 区域基本信息
-        region_info = region_summary[region_summary["所属区域"] == region].iloc[0]
-        parks_in_region = region_df["园区"].dropna().unique().tolist()
-        cities_in_region = region_df["城市"].dropna().unique().tolist()
-        
-        with st.expander(
-            f"📌 {region} - {len(parks_in_region)}个园区，{int(region_info['项目数'])}个项目，{region_info['金额合计']:,.0f}万元"
-        ):
-            # 区域概览指标
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("项目数", int(region_info["项目数"]))
-            with col2:
-                st.metric("金额合计（万元）", f"{region_info['金额合计']:,.0f}")
-            with col3:
-                st.metric("园区数", int(region_info["园区数"]))
-            with col4:
-                st.metric("城市数", int(region_info["城市数"]))
-            
-            # 该区域下各园区统计
-            st.markdown("#### 各园区统计")
-            parks_stats = region_df.groupby("园区", dropna=False).agg(
-                项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
-                城市=("城市", "first"),
-            ).reset_index().sort_values("项目数", ascending=False)
-            parks_stats["金额合计"] = parks_stats["金额合计"].round(2)
-            st.dataframe(parks_stats, use_container_width=True, hide_index=True)
-            
-            # 该区域下各城市统计
-            st.markdown("#### 各城市统计")
-            cities_stats = region_df.groupby("城市", dropna=False).agg(
-                项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
-                园区数=("园区", "nunique"),
-            ).reset_index().sort_values("项目数", ascending=False)
-            cities_stats["金额合计"] = cities_stats["金额合计"].round(2)
-            st.dataframe(cities_stats, use_container_width=True, hide_index=True)
-            
-            # 该区域按专业分类统计
-            st.markdown("#### 按专业分类统计")
-            prof_stats = region_df.groupby("专业", dropna=False).agg(
-                项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
-            ).reset_index().sort_values("项目数", ascending=False)
-            # 过滤掉"其它系统"分类
-            prof_stats = prof_stats[~prof_stats["专业"].isin(["其它系统", "其他系统"])]
-            prof_stats["金额合计"] = prof_stats["金额合计"].round(2)
-            st.dataframe(prof_stats, use_container_width=True, hide_index=True)
-            
-            # 该区域按项目分级统计
-            st.markdown("#### 按项目分级统计")
-            level_stats = region_df.groupby("项目分级", dropna=False).agg(
-                项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
-            ).reset_index().sort_values("项目数", ascending=False)
-            level_stats["金额合计"] = level_stats["金额合计"].round(2)
-            st.dataframe(level_stats, use_container_width=True, hide_index=True)
-            
-            # 该区域项目明细（可选，显示前20条）
-            st.markdown("#### 项目明细（前20条）")
-            detail_cols = ["园区", "城市", "序号", "项目分级", "专业", "项目名称", "拟定金额"]
-            detail_cols = [c for c in detail_cols if c in region_df.columns]
-            st.dataframe(
-                region_df[detail_cols].head(20),
-                use_container_width=True,
-                hide_index=True
-            )
-            if len(region_df) > 20:
-                st.caption(f"共 {len(region_df)} 条项目，仅显示前20条。可在「全部项目」Tab 中查看完整列表。")
 
 
 def generate_pdf_report_html(df: pd.DataFrame, 园区选择: list, output_path: str = None):
@@ -5196,411 +4765,9 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
 def generate_html_report(df: pd.DataFrame, sub: pd.DataFrame, sub_location: pd.DataFrame, 园区选择: list) -> str:
     """生成交互式HTML报告（新版本，完全交互式）"""
     return generate_interactive_html(df, 园区选择)
-    
-    # HTML头部
-    html_parts.append('''
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>养老社区改良改造进度管理报告</title>
-        <style>
-            body {
-                font-family: "Microsoft YaHei", "SimSun", "SimHei", Arial, sans-serif;
-                font-size: 12px;
-                line-height: 1.6;
-                color: #333;
-                padding: 20px;
-                max-width: 1400px;
-                margin: 0 auto;
-            }
-            h1 { font-size: 24px; color: #1f4788; margin-top: 20px; margin-bottom: 15px; text-align: center; }
-            h2 { font-size: 20px; color: #2c5aa0; margin-top: 30px; margin-bottom: 15px; border-bottom: 2px solid #4a7bc8; padding-bottom: 5px; }
-            h3 { font-size: 16px; color: #4a7bc8; margin-top: 20px; margin-bottom: 10px; }
-            h4 { font-size: 14px; margin-top: 15px; margin-bottom: 8px; font-weight: bold; }
-            table { border-collapse: collapse; width: 100%; margin: 15px 0; font-size: 11px; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-            th { background-color: #4a7bc8; color: white; font-weight: bold; }
-            tr:nth-child(even) { background-color: #f9f9f9; }
-            tr:hover { background-color: #f5f5f5; }
-            .metric { display: inline-block; margin: 10px 20px; padding: 15px; background-color: #f0f8ff; border-left: 4px solid #4a7bc8; }
-            .metric-label { font-size: 12px; color: #666; }
-            .metric-value { font-size: 20px; font-weight: bold; color: #1f4788; }
-            .section { margin-bottom: 40px; page-break-inside: avoid; }
-            .chart-container { margin: 20px 0; text-align: center; width: 100%; }
-            .chart-container > div { margin: 20px auto; }
-            .dataframe { width: 100%; }
-            ul { padding-left: 20px; }
-            li { margin: 5px 0; }
-            .tab-section { margin-top: 40px; border-top: 3px solid #4a7bc8; padding-top: 20px; }
-        </style>
-    </head>
-    <body>
-    ''')
-    
-    # 封面
-    html_parts.append(f'''
-        <div class="section">
-            <h1>养老社区改良改造进度管理报告</h1>
-            <div style="text-align: center; margin-top: 40px;">
-                <p style="font-size: 14px;">生成时间：{datetime.now().strftime('%Y年%m月%d日 %H:%M:%S')}</p>
-                <p style="font-size: 14px;">数据统计：共 {len(sub)} 个项目</p>
-            </div>
-        </div>
-        <div style="page-break-after: always;"></div>
-    ''')
-    
-    # 1. 审核流程说明
-    html_parts.append('''
-        <div class="section">
-            <h2>一、需求审核与实施流程说明</h2>
-            <ul>
-                <li><strong>1. 社区提出：</strong>一线园区提出改造需求。</li>
-                <li><strong>2. 紧急程度分级：</strong>按一级（最高级）、二级、三级划分。</li>
-                <li><strong>3. 专业分类：</strong>按 9 大类专业划分：土建、供配电、暖通/供冷、弱电、供排水、电梯、其它、消防、安防等。</li>
-                <li><strong>4. 财务预算拆分：</strong>按预算系统进行金额拆分与汇总。</li>
-                <li><strong>5. 一线立项时间：</strong>一线填写需求并提出立项时间。</li>
-                <li><strong>6. 项目部施工：</strong>项目部根据已确定的需求立项组织施工。</li>
-                <li><strong>7. 总部运行保障部：</strong>督促一线需求稳定，协调总部相关部门把控需求，输出给不动产进行招采、施工。</li>
-                <li><strong>8. 施工验收：</strong>总部运行保障部督促一线园区进行最终施工验收。</li>
-            </ul>
-        </div>
-        <div style="page-break-after: always;"></div>
-    ''')
-    
-    # 2. 项目统计分析 - 使用实际渲染函数生成内容
-    html_parts.append('<div class="section"><h2>二、项目统计分析</h2>')
-    
-    # 2.1 项目数量与费用统计
-    total_count = len(sub)
-    total_amount = sub["拟定金额"].sum() if "拟定金额" in sub.columns else 0
-    
-    html_parts.append(f'''
-        <h3>2.1 项目数量与费用统计</h3>
-        <div class="metric">
-            <div class="metric-label">项目总数</div>
-            <div class="metric-value">{total_count:,}</div>
-        </div>
-        <div class="metric">
-            <div class="metric-label">总金额（万元）</div>
-            <div class="metric-value">{total_amount:,.0f}</div>
-        </div>
-    ''')
-    
-    # 2.2 按园区统计表格
-    park_stats = sub.groupby("园区", dropna=False).agg(
-        项目数=("序号", "count"),
-        金额合计=("拟定金额", "sum"),
-    ).reset_index()
-    park_stats["金额合计"] = park_stats["金额合计"].round(2)
-    
-    html_parts.append('<h3>2.2 按园区统计</h3>')
-    html_parts.append('<table><thead><tr><th>园区</th><th>项目数</th><th>金额合计（万元）</th></tr></thead><tbody>')
-    for _, row in park_stats.iterrows():
-        html_parts.append(f'<tr><td>{row["园区"]}</td><td>{int(row["项目数"])}</td><td>{row["金额合计"]:,.2f}</td></tr>')
-    html_parts.append('</tbody></table>')
-    
-    # 2.3 项目分级占比统计
-    if "项目分级" in sub.columns:
-        html_parts.append('<h3>2.3 项目分级占比统计</h3>')
-        level_mapping = {"一级": "一类", "二级": "二类", "三级": "三类"}
-        sub_copy = sub.copy()
-        sub_copy["项目类别"] = sub_copy["项目分级"].map(level_mapping).fillna(sub_copy["项目分级"])
-        
-        level_stats = sub_copy.groupby("项目类别", dropna=False).agg(
-            项目数=("序号", "count"),
-            金额合计=("拟定金额", "sum"),
-        ).reset_index()
-        
-        total_projects = level_stats["项目数"].sum()
-        total_amount_level = level_stats["金额合计"].sum()
-        
-        if total_projects > 0:
-            level_stats["项目数占比"] = (level_stats["项目数"] / total_projects * 100).round(2)
-            level_stats["金额占比"] = (level_stats["金额合计"] / total_amount_level * 100).round(2) if total_amount_level > 0 else 0
-            level_stats["金额合计"] = level_stats["金额合计"].round(2)
-            
-            html_parts.append('<table><thead><tr><th>项目类别</th><th>项目数</th><th>项目数占比(%)</th><th>金额合计（万元）</th><th>金额占比(%)</th></tr></thead><tbody>')
-            for _, row in level_stats.iterrows():
-                html_parts.append(f'<tr><td>{row["项目类别"]}</td><td>{int(row["项目数"])}</td><td>{row["项目数占比"]:.2f}</td><td>{row["金额合计"]:,.2f}</td><td>{row["金额占比"]:.2f}</td></tr>')
-            html_parts.append('</tbody></table>')
-            
-            # 添加图表（使用plotly生成HTML）
-            try:
-                import plotly.express as px
-                import plotly.graph_objects as go
-                from plotly.utils import PlotlyJSONEncoder
-                import json
-                
-                fig1 = px.pie(
-                    level_stats, values="项目数", names="项目类别",
-                    title="项目数量占比",
-                    color_discrete_sequence=["#FF6B6B", "#4ECDC4", "#45B7D1"]
-                )
-                fig1.update_traces(textposition="outside", textinfo="label+percent+value")
-                
-                fig2 = px.pie(
-                    level_stats, values="金额合计", names="项目类别",
-                    title="项目金额占比",
-                    color_discrete_sequence=["#FF6B6B", "#4ECDC4", "#45B7D1"]
-                )
-                fig2.update_traces(textposition="outside", textinfo="label+percent+value")
-                
-                # 将图表转换为HTML（使用内嵌plotlyjs，确保离线可用）
-                # 第一个图表包含plotlyjs库，后续图表不需要重复包含
-                chart1_html = fig1.to_html(include_plotlyjs=True, div_id="chart1")
-                chart2_html = fig2.to_html(include_plotlyjs=False, div_id="chart2")
-                
-                html_parts.append('<div class="chart-container">')
-                html_parts.append(chart1_html)
-                html_parts.append(chart2_html)
-                html_parts.append('</div>')
-            except ImportError:
-                pass
-    
-    html_parts.append('</div><div style="page-break-after: always;"></div>')
-    
-    # 3. 各园区分级分类统计
-    html_parts.append('<div class="section"><h2>三、各园区分级分类统计</h2>')
-    
-    # 3.1 按分级统计
-    by_level = sub.groupby("项目分级", dropna=False).agg(
-        项目数=("序号", "count"),
-        金额合计=("拟定金额", "sum"),
-    ).reset_index()
-    
-    html_parts.append('<h3>3.1 按紧急程度（分级）统计</h3>')
-    html_parts.append('<table><thead><tr><th>项目分级</th><th>项目数</th><th>金额合计（万元）</th></tr></thead><tbody>')
-    for _, row in by_level.iterrows():
-        level_name = str(row["项目分级"]) if pd.notna(row["项目分级"]) else "未分类"
-        html_parts.append(f'<tr><td>{level_name}</td><td>{int(row["项目数"])}</td><td>{row["金额合计"]:,.2f}</td></tr>')
-    html_parts.append('</tbody></table>')
-    
-    # 3.2 按专业分类统计
-    by_prof = sub.groupby("专业", dropna=False).agg(
-        项目数=("序号", "count"),
-        金额合计=("拟定金额", "sum"),
-    ).reset_index()
-    # 过滤掉"其它系统"分类
-    by_prof = by_prof[~by_prof["专业"].isin(["其它系统", "其他系统"])]
-    
-    html_parts.append('<h3>3.2 按专业分类统计</h3>')
-    html_parts.append('<table><thead><tr><th>专业</th><th>项目数</th><th>金额合计（万元）</th></tr></thead><tbody>')
-    for _, row in by_prof.iterrows():
-        prof_name = str(row["专业"]) if pd.notna(row["专业"]) else "未分类"
-        html_parts.append(f'<tr><td>{prof_name}</td><td>{int(row["项目数"])}</td><td>{row["金额合计"]:,.2f}</td></tr>')
-    html_parts.append('</tbody></table>')
-    
-    html_parts.append('</div><div style="page-break-after: always;"></div>')
-    
-    # 4. 项目明细 - 显示所有数据
-    html_parts.append('<div class="section"><h2>四、项目明细</h2>')
-    html_parts.append(f'<p>共 {len(sub)} 条项目，以下显示所有项目明细：</p>')
-    
-    detail_cols = ["园区", "序号", "项目分级", "专业", "项目名称", "拟定金额"]
-    detail_cols = [c for c in detail_cols if c in sub.columns]
-    detail_df = sub[detail_cols]
-    
-    html_parts.append('<table><thead><tr>')
-    for col in detail_cols:
-        html_parts.append(f'<th>{col}</th>')
-    html_parts.append('</tr></thead><tbody>')
-    
-    for _, row in detail_df.iterrows():
-        html_parts.append('<tr>')
-        for col in detail_cols:
-            val = row[col]
-            if pd.isna(val):
-                html_parts.append('<td></td>')
-            elif isinstance(val, (int, float)):
-                if col == "拟定金额":
-                    html_parts.append(f'<td>{val:,.2f}</td>')
-                else:
-                    html_parts.append(f'<td>{int(val)}</td>')
-            else:
-                html_parts.append(f'<td>{str(val)}</td>')
-        html_parts.append('</tr>')
-    
-    html_parts.append('</tbody></table></div>')
-    
-    # ========== 标签页2: 统计 ==========
-    html_parts.append('<div class="tab-section"><h2>📊 标签页2：统计</h2>')
-    
-    # 按专业统计图表
-    try:
-        import plotly.express as px
-        by_prof_chart = sub_location.groupby("专业", dropna=False).agg(项目数=("序号", "count")).reset_index().sort_values("项目数", ascending=False)
-        # 过滤掉"其它系统"分类
-        by_prof_chart = by_prof_chart[~by_prof_chart["专业"].isin(["其它系统", "其他系统"])]
-        if not by_prof_chart.empty:
-            fig = px.bar(by_prof_chart, x="专业", y="项目数", color="项目数", color_continuous_scale="Blues", text_auto=".0f")
-            fig.update_layout(xaxis_tickangle=-45, showlegend=False, height=400, xaxis_title="专业", yaxis_title="项目数")
-            chart_html = fig.to_html(include_plotlyjs=not plotly_js_included, div_id="chart_prof")
-            if not plotly_js_included:
-                plotly_js_included = True
-            html_parts.append('<h3>按专业 · 项目数</h3>')
-            html_parts.append(f'<div class="chart-container">{chart_html}</div>')
-    except:
-        pass
-    
-    # 按项目分级金额占比
-    try:
-        by_level_chart = sub_location.groupby("项目分级", dropna=False).agg(金额合计=("拟定金额", "sum")).reset_index().sort_values("金额合计", ascending=False)
-        if not by_level_chart.empty:
-            fig = px.pie(by_level_chart, values="金额合计", names="项目分级", title="按项目分级 · 金额占比", hole=0.35)
-            fig.update_traces(textposition="outside", textinfo="label+percent+value", texttemplate="%{label}<br>%{percent}<br>%{value:,.0f}万元")
-            chart_html = fig.to_html(include_plotlyjs=False, div_id="chart_level")
-            html_parts.append('<h3>按项目分级 · 金额占比</h3>')
-            html_parts.append(f'<div class="chart-container">{chart_html}</div>')
-    except:
-        pass
-    
-    # 按园区金额统计
-    try:
-        by_park_chart = sub_location.groupby("园区", dropna=False).agg(金额合计=("拟定金额", "sum")).reset_index().sort_values("金额合计", ascending=False)
-        if not by_park_chart.empty:
-            by_park_chart["金额合计"] = by_park_chart["金额合计"].round(2)
-            fig = px.bar(by_park_chart.head(20), x="园区", y="金额合计", color="金额合计", color_continuous_scale="Blues", text_auto=".0f")
-            fig.update_layout(xaxis_tickangle=-45, showlegend=False, height=400, xaxis_title="园区", yaxis_title="金额（万元）")
-            chart_html = fig.to_html(include_plotlyjs=False, div_id="chart_park")
-            html_parts.append('<h3>按园区 · 金额（万元）</h3>')
-            html_parts.append(f'<div class="chart-container">{chart_html}</div>')
-    except:
-        pass
-    
-    html_parts.append('</div>')
-    
-    # ========== 标签页3: 地区分析 ==========
-    if "所属区域" in sub_location.columns:
-        html_parts.append('<div class="tab-section"><h2>🌍 标签页3：地区分析</h2>')
-        sub_region = sub_location[sub_location["所属区域"] != "其他"].copy()
-        
-        if not sub_region.empty:
-            region_summary = sub_region.groupby("所属区域", dropna=False).agg(
-                项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
-                园区数=("园区", "nunique"),
-                城市数=("城市", "nunique"),
-            ).reset_index().sort_values("项目数", ascending=False)
-            region_summary["金额合计"] = region_summary["金额合计"].round(2)
-            
-            html_parts.append('<h3>按所属区域统计</h3>')
-            html_parts.append('<table><thead><tr><th>所属区域</th><th>项目数</th><th>金额合计（万元）</th><th>园区数</th><th>城市数</th></tr></thead><tbody>')
-            for _, row in region_summary.iterrows():
-                html_parts.append(f'<tr><td>{row["所属区域"]}</td><td>{int(row["项目数"])}</td><td>{row["金额合计"]:,.2f}</td><td>{int(row["园区数"])}</td><td>{int(row["城市数"])}</td></tr>')
-            html_parts.append('</tbody></table>')
-            
-            # 区域对比图表
-            try:
-                fig = px.bar(region_summary, x="所属区域", y="金额合计", color="金额合计", color_continuous_scale="Viridis", text_auto=".0f")
-                fig.update_layout(xaxis_tickangle=-45, showlegend=False, height=400, xaxis_title="所属区域", yaxis_title="金额（万元）")
-                chart_html = fig.to_html(include_plotlyjs=False, div_id="chart_region")
-                html_parts.append('<h3>各区域金额对比</h3>')
-                html_parts.append(f'<div class="chart-container">{chart_html}</div>')
-            except:
-                pass
-        
-        html_parts.append('</div>')
-    
-    # ========== 标签页4: 各园区分级分类 ==========
-    html_parts.append('<div class="tab-section"><h2>📋 标签页4：各园区分级分类</h2>')
-    
-    # 按分级、专业、园区统计表格
-    html_parts.append('<h3>按紧急程度（分级）统计</h3>')
-    by_level_tab4 = sub.groupby("项目分级", dropna=False).agg(项目数=("序号", "count"), 金额合计=("拟定金额", "sum")).reset_index()
-    html_parts.append('<table><thead><tr><th>项目分级</th><th>项目数</th><th>金额合计（万元）</th></tr></thead><tbody>')
-    for _, row in by_level_tab4.iterrows():
-        level_name = str(row["项目分级"]) if pd.notna(row["项目分级"]) else "未分类"
-        html_parts.append(f'<tr><td>{level_name}</td><td>{int(row["项目数"])}</td><td>{row["金额合计"]:,.2f}</td></tr>')
-    html_parts.append('</tbody></table>')
-    
-    html_parts.append('<h3>按专业分类统计</h3>')
-    by_prof_tab4 = sub.groupby("专业", dropna=False).agg(项目数=("序号", "count"), 金额合计=("拟定金额", "sum")).reset_index()
-    # 过滤掉"其它系统"分类
-    by_prof_tab4 = by_prof_tab4[~by_prof_tab4["专业"].isin(["其它系统", "其他系统"])]
-    html_parts.append('<table><thead><tr><th>专业</th><th>项目数</th><th>金额合计（万元）</th></tr></thead><tbody>')
-    for _, row in by_prof_tab4.iterrows():
-        prof_name = str(row["专业"]) if pd.notna(row["专业"]) else "未分类"
-        html_parts.append(f'<tr><td>{prof_name}</td><td>{int(row["项目数"])}</td><td>{row["金额合计"]:,.2f}</td></tr>')
-    html_parts.append('</tbody></table>')
-    
-    # 按专业分包统计（如果存在该列）
-    if "专业分包" in sub.columns or "专业细分" in sub.columns:
-        prof_subcontract_col = "专业分包" if "专业分包" in sub.columns else "专业细分"
-        html_parts.append('<h3>按专业分包统计</h3>')
-        by_prof_subcontract_tab4 = sub.groupby(prof_subcontract_col, dropna=False).agg(项目数=("序号", "count"), 金额合计=("拟定金额", "sum")).reset_index().sort_values("金额合计", ascending=False)
-        html_parts.append('<table><thead><tr><th>专业分包</th><th>项目数</th><th>金额合计（万元）</th></tr></thead><tbody>')
-        for _, row in by_prof_subcontract_tab4.iterrows():
-            subcontract_name = str(row[prof_subcontract_col]) if pd.notna(row[prof_subcontract_col]) else "未分类"
-            html_parts.append(f'<tr><td>{subcontract_name}</td><td>{int(row["项目数"])}</td><td>{row["金额合计"]:,.2f}</td></tr>')
-    html_parts.append('</tbody></table>')
-    
-    html_parts.append('<h3>按园区统计</h3>')
-    by_park_tab4 = sub.groupby("园区", dropna=False).agg(项目数=("序号", "count"), 金额合计=("拟定金额", "sum")).reset_index()
-    html_parts.append('<table><thead><tr><th>园区</th><th>项目数</th><th>金额合计（万元）</th></tr></thead><tbody>')
-    for _, row in by_park_tab4.iterrows():
-        html_parts.append(f'<tr><td>{row["园区"]}</td><td>{int(row["项目数"])}</td><td>{row["金额合计"]:,.2f}</td></tr>')
-    html_parts.append('</tbody></table>')
-    
-    html_parts.append('</div>')
-    
-    # ========== 标签页5: 总部视图 ==========
-    html_parts.append('<div class="tab-section"><h2>🏢 标签页5：总部视图</h2>')
-    
-    try:
-        from data_loader import get_稳定需求_mask
-        stable_mask = get_稳定需求_mask(sub)
-        stable = sub[stable_mask]
-        
-        html_parts.append('<h3>各园区已确定稳定需求数量与金额</h3>')
-        summary = stable.groupby("园区", dropna=False).agg(稳定需求数量=("序号", "count"), 稳定需求金额=("拟定金额", "sum")).reset_index()
-        html_parts.append('<table><thead><tr><th>园区</th><th>稳定需求数量</th><th>稳定需求金额（万元）</th></tr></thead><tbody>')
-        for _, row in summary.iterrows():
-            html_parts.append(f'<tr><td>{row["园区"]}</td><td>{int(row["稳定需求数量"])}</td><td>{row["稳定需求金额"]:,.2f}</td></tr>')
-        html_parts.append('</tbody></table>')
-    except:
-        html_parts.append('<p>稳定需求数据暂不可用</p>')
-    
-    html_parts.append('</div>')
-    
-    # ========== 标签页6: 全部项目 ==========
-    html_parts.append('<div class="tab-section"><h2>📑 标签页6：全部项目清单</h2>')
-    html_parts.append(f'<p>共 {len(df)} 条项目，以下列出所有项目明细：</p>')
-    
-    # 显示所有列
-    display_cols = ["园区", "所属区域", "城市"] + [c for c in df.columns if c not in ["园区", "所属区域", "城市"]]
-    display_cols = [c for c in display_cols if c in df.columns]
-    
-    html_parts.append('<table style="font-size: 10px;"><thead><tr>')
-    for col in display_cols:
-        html_parts.append(f'<th>{col}</th>')
-    html_parts.append('</tr></thead><tbody>')
-    
-    for _, row in df.iterrows():
-        html_parts.append('<tr>')
-        for col in display_cols:
-            val = row[col]
-            if pd.isna(val):
-                html_parts.append('<td></td>')
-            elif isinstance(val, (int, float)):
-                if "金额" in str(col) or "金额" in str(col):
-                    html_parts.append(f'<td>{val:,.2f}</td>')
-                else:
-                    html_parts.append(f'<td>{int(val)}</td>')
-            else:
-                html_parts.append(f'<td>{str(val)[:50]}</td>')  # 限制长度避免表格过宽
-        html_parts.append('</tr>')
-    
-    html_parts.append('</tbody></table></div>')
-    
-    # HTML尾部
-    html_parts.append('''
-    </body>
-    </html>
-    ''')
-    
-    return ''.join(html_parts)
+
+
+
 
 
 def generate_pdf_report(df: pd.DataFrame, 园区选择: list, output_path: str = None):
@@ -5609,36 +4776,27 @@ def generate_pdf_report(df: pd.DataFrame, 园区选择: list, output_path: str =
 
 
 def _get_deepseek_api_key(provided: str | None = None) -> str | None:
-    """获取 DeepSeek API Key：Secrets/环境变量优先（Cloud 部署可靠），再读侧栏/传入值。"""
+    """获取 DeepSeek API Key：优先使用传入值，否则 session_state、Streamlit Secrets、环境变量。"""
     if provided and str(provided).strip():
         return str(provided).strip()
-    # 1) Streamlit Secrets（Cloud 上 Settings → Secrets，键名 deepseek_api_key 或 DEEPSEEK_API_KEY）
+    key = st.session_state.get("deepseek_api_key") or ""
+    if key and str(key).strip():
+        return str(key).strip()
+    # Streamlit Secrets：无 secrets.toml 时会 FileNotFoundError，键不存在会 KeyError
     try:
         if hasattr(st, "secrets") and st.secrets:
             for secret_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
-                val = None
                 try:
                     val = st.secrets[secret_key]
+                    if val and str(val).strip():
+                        return str(val).strip()
                 except (KeyError, AttributeError, TypeError):
-                    pass
-                if val is None and hasattr(st.secrets, secret_key):
-                    val = getattr(st.secrets, secret_key, None)
-                if val is not None and str(val).strip():
-                    return str(val).strip()
+                    continue
     except FileNotFoundError:
         pass
     except Exception:
         pass
-    # 2) 环境变量（Cloud 有时会把 Secrets 注入为环境变量）
-    for env_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
-        v = os.getenv(env_key)
-        if v and str(v).strip():
-            return str(v).strip()
-    # 3) 侧栏/当前页输入
-    key = (st.session_state.get("deepseek_api_key") or "").strip()
-    if key:
-        return key
-    return None
+    return os.getenv("DEEPSEEK_API_KEY") or None
 
 
 def _get_deepseek_client(api_key: str | None = None):
@@ -5662,8 +4820,8 @@ def _answer_with_deepseek(api_key: str | None, question: str, df: pd.DataFrame) 
     if client is None:
         return (
             "未检测到可用的 DeepSeek 客户端。\n\n"
-            "请在左侧或当前页填写 DeepSeek API Key；若使用 **Streamlit Secrets**，在 Secrets 中配置：\n"
-            "`DEEPSEEK_API_KEY = \"sk-...\"` 或 `deepseek_api_key = \"sk-...\"`，保存后重新部署。"
+            "请在左侧或当前页中正确填写 DeepSeek API Key（建议使用 Streamlit Secrets 或环境变量），"
+            "或联系管理员配置后再重试。"
         )
     # 只提供列信息，不传输完整数据
     cols = list(df.columns)[:30]
@@ -5834,34 +4992,6 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
             fig.update_layout(xaxis_tickangle=-45, showlegend=False, margin=dict(t=20, b=80), height=320, xaxis_title="", yaxis_title="金额（万元）")
             fig.update_traces(textfont_size=10)
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    
-    # 添加按区域统计的图表（已合并到区域对比分析中，此处删除重复图表）
-        
-        # 区域饼图
-        st.markdown("**按所属区域 · 金额分布（万元）**")
-        by_region_pie = sub.groupby("所属区域", dropna=False).agg(金额合计=("拟定金额", "sum")).reset_index()
-        by_region_pie = by_region_pie[by_region_pie["所属区域"] != "其他"].sort_values("金额合计", ascending=False)
-        by_region_pie["金额合计"] = by_region_pie["金额合计"].round(2)
-        if not by_region_pie.empty:
-            colors_region = ["#FF6B6B", "#4ECDC4", "#45B7D1", "#FFA07A", "#98D8C8"]
-            fig = px.pie(
-                by_region_pie, values="金额合计", names="所属区域", title="",
-                color_discrete_sequence=colors_region, hole=0.4,
-            )
-            fig.update_traces(
-                textposition="outside",
-                textinfo="label+percent+value",
-                texttemplate="%{label}<br>%{percent}<br>%{value:,.0f}万元",
-                textfont_size=12,
-                pull=[0.05] * len(by_region_pie),
-            )
-            fig.update_layout(
-                showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.15),
-                margin=dict(t=20, b=80, l=20, r=20),
-                height=400,
-            )
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
     st.markdown("**按专业 · 金额合计（万元）**")
     by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("拟定金额", "sum")).reset_index().sort_values("金额", ascending=False)
@@ -5887,44 +5017,29 @@ def _render_project_wizard(df: pd.DataFrame):
 
     if mode == "修改已有项目":
         st.markdown("### 步骤 1：查找要修改的项目")
-        # 排除的列：地区、社区、序号（以及“所属区域”视为地区）
-        exclude_search_cols = {"序号", "地区", "社区", "所属区域"}
-        searchable_cols = [c for c in df_all.columns if c not in exclude_search_cols]
-        if not searchable_cols:
-            searchable_cols = ["园区", "项目名称", "项目分级", "专业"]
-
-        parks = sorted(df_all["园区"].dropna().astype(str).unique().tolist())
-        parks = [p for p in parks if p and p.strip()]
-        if not parks:
-            parks = sorted(set(园区_TO_城市.keys()))
-
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
-            园区选择 = st.selectbox("选择园区", options=[""] + parks, format_func=lambda x: x if x else "请选择园区")
+            seq_input = st.text_input("按序号查找（可选）", value="", placeholder="例如：12")
         with col2:
-            查找字段 = st.selectbox("按字段查找", options=[""] + searchable_cols, format_func=lambda x: x if x else "请选择字段")
-        with col3:
-            查找关键词 = st.text_input("查找关键词", value="", placeholder="输入关键词进行模糊匹配")
+            name_kw = st.text_input("按项目名称关键词查找（可选）", value="", placeholder="例如：配电、外立面等")
 
         target_row = None
-        if not 园区选择:
-            st.info("请先选择园区，再选择查找字段并输入关键词完成查询。")
+        if not seq_input.strip() and not name_kw.strip():
+            st.info("请先输入序号或项目名称关键词，然后回车进行查找。")
             return
 
-        candidates = df_all[df_all["园区"].astype(str) == 园区选择].copy()
-        if candidates.empty:
-            st.info("该园区下暂无项目，可切换园区或切换到“新增项目”。")
-            return
-
-        if 查找字段 and 查找关键词.strip():
-            col_series = candidates[查找字段].astype(str)
-            candidates = candidates[col_series.str.contains(查找关键词.strip(), na=False)]
-        elif 查找字段 and not 查找关键词.strip():
-            st.info("已按园区筛选，请输入查找关键词或直接在下拉中选择要修改的项目。")
-        # 若未选字段：仅按园区展示全部，允许直接选序号
+        candidates = df_raw
+        if seq_input.strip():
+            try:
+                seq_val = int(float(seq_input.strip()))
+                candidates = candidates[pd.to_numeric(candidates["序号"], errors="coerce") == seq_val]
+            except ValueError:
+                candidates = candidates.iloc[0:0]
+        if name_kw.strip():
+            candidates = candidates[candidates["项目名称"].astype(str).str.contains(name_kw.strip(), na=False)]
 
         if candidates.empty:
-            st.info("未找到匹配项目，请调整查找关键词或切换园区。")
+            st.info("未找到匹配项目，可切换到“新增项目”，或调整查找条件。")
             return
 
         st.caption(f"找到 {len(candidates)} 条记录，请选择一条进行修改：")
@@ -5938,10 +5053,9 @@ def _render_project_wizard(df: pd.DataFrame):
 
         st.markdown("---")
         st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
-        if _get_feishu_webhook_url():
-            st.info("修改的内容会被推送到飞书。")
 
         with st.form("edit_project_form"):
+            st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次修改的内容（含字段变更详情）将推送到飞书。")
             st.markdown("**基础信息**")
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -6066,6 +5180,7 @@ def _render_project_wizard(df: pd.DataFrame):
 
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
+        st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次录入的内容（含字段信息）将推送到飞书。")
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -6274,17 +5389,6 @@ def main():
             else:
                 st.warning("请填写有效目录路径")
 
-        st.markdown("---")
-        with st.expander("飞书推送", expanded=True):
-            st.caption("保存到数据库时会自动推送通知到飞书群。需先在飞书群添加「自定义机器人」并复制 Webhook 地址。配置 Webhook 后无需勾选，保存即推送。")
-            st.text_input(
-                "飞书机器人 Webhook URL",
-                key="feishu_webhook_url",
-                type="password",
-                placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...",
-                help="本页填写、或 .streamlit/secrets.toml 中 feishu_webhook_url、或环境变量 FEISHU_WEBHOOK_URL，任一配置即可。",
-            )
-
         if not df.empty:
             parks = df["园区"].dropna().unique().tolist()
             parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
@@ -6354,13 +5458,15 @@ def main():
     with tab4:
         st.subheader("项目录入 / 修改向导")
         st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
+        if _get_feishu_webhook_url():
+            st.info("💬 只要修改了数据并保存，飞书将自动收到消息推送。")
         _render_project_wizard(df)
     with tab5:
         st.subheader("AI 助手（DeepSeek 驱动）")
         st.markdown(
             """
             这个 AI 窗口用于：**使用说明**、**查询与筛选建议**（如“帮我查找三月立项的项目”）。  
-            在下方填写 API Key，或在 Streamlit Secrets / 环境变量中配置 `DEEPSEEK_API_KEY` 或 `deepseek_api_key` 后即可对话。
+            需在 `.streamlit/secrets.toml` 或环境变量中配置 `DEEPSEEK_API_KEY` 后即可对话。
             """
         )
         api_key = _get_deepseek_api_key()
