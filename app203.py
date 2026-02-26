@@ -172,16 +172,19 @@ def _get_next_序号(df: pd.DataFrame) -> int:
 # ---------- 飞书推送（自定义机器人 Webhook）----------
 def _get_feishu_webhook_url() -> str | None:
     """获取飞书 Webhook URL：Secrets/环境变量优先（保证部署后能推送），再读侧栏输入。"""
-    # 1) 优先 Secrets（.streamlit/secrets.toml 或 Cloud 配置）
+    # 1) Secrets（.streamlit/secrets.toml 或 Cloud 里 feishu_webhook_url）
     try:
         if hasattr(st, "secrets") and st.secrets:
             for key in ("FEISHU_WEBHOOK_URL", "feishu_webhook_url"):
+                v = None
                 try:
                     v = st.secrets[key]
-                    if v and str(v).strip().startswith("https://"):
-                        return str(v).strip()
                 except (KeyError, AttributeError, TypeError):
-                    continue
+                    pass
+                if v is None and hasattr(st.secrets, key):
+                    v = getattr(st.secrets, key, None)
+                if v and str(v).strip().startswith("https://"):
+                    return str(v).strip()
     except FileNotFoundError:
         pass
     except Exception:
@@ -191,7 +194,7 @@ def _get_feishu_webhook_url() -> str | None:
         env_url = os.getenv(env_key)
         if env_url and str(env_url).strip().startswith("https://"):
             return str(env_url).strip()
-    # 3) 侧栏输入（未展开时可能为空）
+    # 3) 侧栏输入
     url = (st.session_state.get("feishu_webhook_url") or "").strip()
     if url and url.startswith("https://"):
         return url
@@ -5609,21 +5612,24 @@ def _get_deepseek_api_key(provided: str | None = None) -> str | None:
     """获取 DeepSeek API Key：Secrets/环境变量优先（Cloud 部署可靠），再读侧栏/传入值。"""
     if provided and str(provided).strip():
         return str(provided).strip()
-    # 1) Streamlit Secrets 优先（Cloud 上在 Settings → Secrets 里填）
+    # 1) Streamlit Secrets（Cloud 上 Settings → Secrets，键名 deepseek_api_key 或 DEEPSEEK_API_KEY）
     try:
         if hasattr(st, "secrets") and st.secrets:
             for secret_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
+                val = None
                 try:
                     val = st.secrets[secret_key]
-                    if val and str(val).strip():
-                        return str(val).strip()
                 except (KeyError, AttributeError, TypeError):
-                    continue
+                    pass
+                if val is None and hasattr(st.secrets, secret_key):
+                    val = getattr(st.secrets, secret_key, None)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
     except FileNotFoundError:
         pass
     except Exception:
         pass
-    # 2) 环境变量
+    # 2) 环境变量（Cloud 有时会把 Secrets 注入为环境变量）
     for env_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
         v = os.getenv(env_key)
         if v and str(v).strip():
