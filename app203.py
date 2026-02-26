@@ -10,8 +10,9 @@ import tempfile
 import io
 import base64
 import os
+import sqlite3
 from datetime import datetime
-from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask
+from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask, TIMELINE_COLS
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
 try:
@@ -62,6 +63,108 @@ DEFAULT_SINGLE_FILE = str(
     "土建设施", "供配电系统", "暖通/供冷系统", "弱电系统", "供排水系统",
     "电梯系统", "其它系统", "消防系统", "安防系统"
 ]
+
+# ---------- 团队共享数据：SQLite 存储 ----------
+DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
+
+
+def _get_db_connection():
+    return sqlite3.connect(DB_PATH)
+
+
+def load_from_db() -> pd.DataFrame:
+    """从 SQLite 加载团队共享数据表 projects。若不存在则返回空表。"""
+    if not Path(DB_PATH).exists():
+        return pd.DataFrame()
+    try:
+        with _get_db_connection() as conn:
+            return pd.read_sql("SELECT * FROM projects", conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+def save_to_db(df: pd.DataFrame):
+    """将当前 DataFrame 全量写入 SQLite（覆盖 projects 表）。"""
+    if df is None or df.empty:
+        return
+    with _get_db_connection() as conn:
+        df.to_sql("projects", conn, if_exists="replace", index=False)
+
+
+def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """保证关键列存在，便于新增/修改向导统一写入。"""
+    needed = [
+        "序号", "园区", "所属区域", "城市", "所属业态",
+        "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
+        "专业", "专业分包", "项目名称", "备注说明", "拟定金额", "上传凭证",
+    ]
+    out = df.copy()
+    for col in needed:
+        if col not in out.columns:
+            out[col] = "" if col not in ["序号", "拟定金额"] else 0
+    return out
+
+
+def _strip_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """去掉列名为空字符串的列，避免 data_editor 因重复空列名报错。"""
+    keep_cols = [c for c in df.columns if str(c).strip() != ""]
+    return df[keep_cols].copy()
+
+
+def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    加载后统一规范化：只保留分析所需列、合并城市列、固定列顺序，避免多列/错位导致后面列显示为空。
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out = _strip_empty_columns(out)
+    if "社区" in out.columns and "园区" not in out.columns:
+        out = out.rename(columns={"社区": "园区"})
+    elif "社区" in out.columns and "园区" in out.columns:
+        out["园区"] = out["园区"].fillna(out["社区"])
+        out = out.drop(columns=["社区"], errors="ignore")
+    if "所在城市" in out.columns:
+        if "城市" not in out.columns:
+            out["城市"] = out["所在城市"]
+        else:
+            out["城市"] = out["城市"].fillna(out["所在城市"])
+        out = out.drop(columns=["所在城市"], errors="ignore")
+    if "专业细分" in out.columns and "专业分包" not in out.columns:
+        out["专业分包"] = out["专业细分"]
+    if "专业细分" in out.columns and "专业分包" in out.columns:
+        out["专业分包"] = out["专业分包"].fillna(out["专业细分"])
+    if "专业细分" in out.columns:
+        out = out.drop(columns=["专业细分"], errors="ignore")
+    if "拟定金额" in out.columns:
+        out["拟定金额"] = pd.to_numeric(out["拟定金额"], errors="coerce").fillna(0)
+    if "序号" in out.columns:
+        out["序号"] = pd.to_numeric(out["序号"], errors="coerce")
+    base_order = [
+        "序号", "园区", "所属区域", "城市", "所属业态",
+        "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
+        "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+    ]
+    timeline_cols = [c for c in TIMELINE_COLS if c in out.columns]
+    extra = ["上传凭证"] if "上传凭证" in out.columns else []
+    want = base_order + timeline_cols + extra
+    existing = list(out.columns)
+    ordered = [c for c in want if c in existing]
+    rest = [c for c in existing if c not in ordered]
+    out = out[ordered + rest].copy()
+    return out
+
+
+def _get_next_序号(df: pd.DataFrame) -> int:
+    """根据现有数据自动生成下一个序号。"""
+    if "序号" not in df.columns or df.empty:
+        return 1
+    try:
+        nums = pd.to_numeric(df["序号"], errors="coerce")
+        m = nums.max()
+        return int(m) + 1 if pd.notna(m) else 1
+    except Exception:
+        return 1
 
 
 @st.cache_data(ttl=300)
@@ -5512,29 +5615,264 @@ def render_地图与统计(df: pd.DataFrame, 园区选择: list):
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
+def _render_project_wizard(df: pd.DataFrame):
+    """项目新增 / 修改：平铺表单。新增有必填校验，修改全部选填，只改想改的字段。"""
+    import uuid
+    df_raw = df.copy()
+    df_all = _ensure_project_columns(df)
+
+    mode = st.radio("操作类型", ["新增项目", "修改已有项目"], horizontal=True)
+
+    if mode == "修改已有项目":
+        st.markdown("### 步骤 1：查找要修改的项目")
+        col1, col2 = st.columns(2)
+        with col1:
+            seq_input = st.text_input("按序号查找（可选）", value="", placeholder="例如：12")
+        with col2:
+            name_kw = st.text_input("按项目名称关键词查找（可选）", value="", placeholder="例如：配电、外立面等")
+
+        target_row = None
+        if not seq_input.strip() and not name_kw.strip():
+            st.info("请先输入序号或项目名称关键词，然后回车进行查找。")
+            return
+
+        candidates = df_raw
+        if seq_input.strip():
+            try:
+                seq_val = int(float(seq_input.strip()))
+                candidates = candidates[pd.to_numeric(candidates["序号"], errors="coerce") == seq_val]
+            except ValueError:
+                candidates = candidates.iloc[0:0]
+        if name_kw.strip():
+            candidates = candidates[candidates["项目名称"].astype(str).str.contains(name_kw.strip(), na=False)]
+
+        if candidates.empty:
+            st.info("未找到匹配项目，可切换到“新增项目”，或调整查找条件。")
+            return
+
+        st.caption(f"找到 {len(candidates)} 条记录，请选择一条进行修改：")
+        display_cols = ["序号", "园区", "项目名称", "项目分级", "拟定金额"]
+        display_cols = [c for c in display_cols if c in candidates.columns]
+        st.dataframe(candidates[display_cols].head(50), use_container_width=True, hide_index=True)
+
+        seq_choices = sorted(candidates["序号"].dropna().astype(int).unique().tolist())
+        chosen_seq = st.selectbox("选择要修改的项目序号", options=seq_choices)
+        target_row = df_all[df_all["序号"].astype(int) == int(chosen_seq)].iloc[0]
+
+        st.markdown("---")
+        st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
+
+        with st.form("edit_project_form"):
+            st.markdown("**基础信息**")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.text_input("序号（自动）", value=str(int(target_row["序号"])), disabled=True)
+                园区_options = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
+                园区默认 = str(target_row.get("园区", ""))
+                园区 = st.selectbox(
+                    "园区（选填）",
+                    options=[""] + 园区_options,
+                    index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0,
+                )
+            with c2:
+                所属区域 = st.text_input("所属区域（选填）", value=str(target_row.get("所属区域", "")))
+                城市 = st.text_input("所在城市（选填）", value=str(target_row.get("城市", "")))
+            with c3:
+                所属业态 = st.text_input("所属业态（选填）", value=str(target_row.get("所属业态", "")))
+
+            st.markdown("**项目属性**")
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                项目分级 = st.text_input("项目分级（选填）", value=str(target_row.get("项目分级", "")))
+            with c5:
+                项目分类 = st.text_input("项目分类（选填）", value=str(target_row.get("项目分类", "")))
+            with c6:
+                拟定承建组织 = st.text_input("拟定承建组织（选填）", value=str(target_row.get("拟定承建组织", "")))
+
+            c7, c8 = st.columns(2)
+            with c7:
+                总部重点关注项目 = st.text_input("总部重点关注项目（选填）", value=str(target_row.get("总部重点关注项目", "")))
+            with c8:
+                拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
+
+            st.markdown("**专业与名称**")
+            c9, c10 = st.columns(2)
+            with c9:
+                专业 = st.text_input("专业（选填）", value=str(target_row.get("专业", "")))
+            with c10:
+                专业分包 = st.text_input("专业分包（选填）", value=str(target_row.get("专业分包", "")))
+            项目名称 = st.text_input("项目名称（选填）", value=str(target_row.get("项目名称", "")))
+            备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
+
+            st.markdown("**项目节点日期（全部选填）**")
+            date_values = {}
+            for col in TIMELINE_COLS:
+                if col not in df_all.columns:
+                    continue
+                raw_val = target_row.get(col, "")
+                date_str = "" if pd.isna(raw_val) else str(raw_val)
+                date_values[col] = st.text_input(f"{col}", value=date_str)
+
+            col_save, col_del = st.columns(2)
+            with col_save:
+                submitted = st.form_submit_button("💾 保存修改")
+            with col_del:
+                delete_clicked = st.form_submit_button("🗑 删除该项目")
+
+        seq_val = int(target_row["序号"])
+        if delete_clicked:
+            df_new = df_all[df_all["序号"].astype(int) != seq_val].copy()
+            save_to_db(df_new)
+            st.success(f"已删除序号为 {seq_val} 的项目。")
+            st.rerun()
+
+        if submitted:
+            df_new = df_all.copy()
+            mask = df_new["序号"].astype(int) == seq_val
+            update_dict = {
+                "园区": 园区,
+                "所属区域": 所属区域,
+                "城市": 城市,
+                "所属业态": 所属业态,
+                "项目分级": 项目分级,
+                "项目分类": 项目分类,
+                "拟定承建组织": 拟定承建组织,
+                "总部重点关注项目": 总部重点关注项目,
+                "专业": 专业,
+                "专业分包": 专业分包,
+                "项目名称": 项目名称,
+                "备注说明": 备注说明,
+                "拟定金额": 拟定金额,
+            }
+            for col, val in update_dict.items():
+                if col in df_new.columns:
+                    df_new.loc[mask, col] = val
+            for col, val in date_values.items():
+                if col in df_new.columns:
+                    df_new.loc[mask, col] = val
+            save_to_db(df_new)
+            st.success("已保存修改。")
+            st.rerun()
+        return
+
+    # ---------- 新增项目 ----------
+    st.markdown("### 新增项目")
+    df_all = _ensure_project_columns(df_all)
+    next_seq = _get_next_序号(df_all)
+    required_fields = ["园区", "所属业态", "项目分级", "项目分类", "拟定承建组织", "专业", "项目名称"]
+
+    with st.form("add_project_form"):
+        st.caption(f"新项目序号将自动设置为：{next_seq}")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            parks = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
+            园区 = st.selectbox("园区（必填）", options=[""] + parks)
+        with c2:
+            所属区域 = st.text_input("所属区域（选填）")
+        with c3:
+            城市 = st.text_input("所在城市（选填）")
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            所属业态 = st.text_input("所属业态（必填，例如：独立 / 护理等）")
+        with c5:
+            项目分级 = st.text_input("项目分级（必填，例如：一级/二级/三级）")
+        with c6:
+            项目分类 = st.text_input("项目分类（必填，例如：品质提升 / 大修等）")
+
+        c7, c8 = st.columns(2)
+        with c7:
+            拟定承建组织 = st.text_input("拟定承建组织（必填，例如：项目部 / 社区分包）")
+        with c8:
+            总部重点关注项目 = st.text_input("总部重点关注项目（选填）")
+
+        c9, c10 = st.columns(2)
+        with c9:
+            专业 = st.text_input("专业（必填，例如：土建设施 / 供配电等）")
+        with c10:
+            专业分包 = st.text_input("专业分包（选填，例如：土建-结构）")
+
+        项目名称 = st.text_input("项目名称（必填）")
+        备注说明 = st.text_area("备注说明（选填）")
+        拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=0.0, step=1.0)
+
+        st.markdown("**项目节点日期（全部选填）**")
+        date_values = {}
+        for col in TIMELINE_COLS:
+            date_values[col] = st.text_input(f"{col}", value="", key=f"add_{col}")
+
+        submitted = st.form_submit_button("✅ 完成并写入数据库")
+
+    if submitted:
+        form_dict = {
+            "序号": next_seq,
+            "园区": 园区,
+            "所属区域": 所属区域,
+            "城市": 城市,
+            "所属业态": 所属业态,
+            "项目分级": 项目分级,
+            "项目分类": 项目分类,
+            "拟定承建组织": 拟定承建组织,
+            "总部重点关注项目": 总部重点关注项目,
+            "专业": 专业,
+            "专业分包": 专业分包,
+            "项目名称": 项目名称,
+            "备注说明": 备注说明,
+            "拟定金额": 拟定金额,
+        }
+        missing = [k for k in required_fields if not str(form_dict.get(k, "")).strip()]
+        if missing:
+            st.error(f"以下字段为必填：{', '.join(missing)}")
+            return
+
+        if not form_dict["所属区域"] and 园区 in 园区_TO_区域:
+            form_dict["所属区域"] = 园区_TO_区域[园区]
+        if not form_dict["城市"] and 园区 in 园区_TO_城市:
+            form_dict["城市"] = 园区_TO_城市[园区]
+
+        token = str(uuid.uuid4())
+        form_dict["上传凭证"] = token
+        for col, val in date_values.items():
+            form_dict[col] = val
+
+        df_new_row = pd.DataFrame([form_dict])
+        df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
+        save_to_db(df_all2)
+        st.success(f"已写入数据库。上传凭证：{token}")
+        st.info("请截图或记录该凭证号，后续如需确认或审计可用于检索。")
+        st.rerun()
+
+
 def main():
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
 
-    # 侧边栏：数据源
+    # 侧边栏：数据源（团队共享 SQLite + 导入入口）
     with st.sidebar:
         st.header("数据源")
-        source = st.radio("数据来源", ["单文件", "目录下全部 CSV"], index=0)
+        source = st.radio(
+            "数据来源",
+            ["数据库（团队共享）", "上传文件（覆盖数据库）", "目录下全部 CSV（覆盖数据库）"],
+            index=0,
+        )
+        df_db = load_from_db()
         df = pd.DataFrame()
-        manual_df = pd.DataFrame()
-        if source == "单文件":
-            update_backend = st.checkbox(
-                "上传CSV后同时更新后台默认数据文件",
-                value=False,
-                help="勾选后，上传的CSV会覆盖当前目录下的默认数据文件（改良改造报表-V4.csv），用于后续所有访问。",
-            )
+
+        if source == "数据库（团队共享）":
+            if df_db.empty:
+                st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
+            else:
+                st.success(f"已从数据库加载，共 {len(df_db)} 条记录（所有用户共享）。")
+                df = df_db
+
+        elif source == "上传文件（覆盖数据库）":
             uploaded = st.file_uploader(
-                "上传 CSV 或 Excel 文件",
+                "上传 CSV 或 Excel 文件（导入并覆盖数据库）",
                 type=["csv", "xlsx", "xls"],
                 help="支持 .csv 或 .xlsx。xlsx 会按分表自动识别进度表并合并（表头两行、含序号/项目分级/专业/拟定金额）。",
             )
             if uploaded is not None:
-                import tempfile
                 suffix = Path(uploaded.name).suffix.lower() or ".csv"
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                     tmp.write(uploaded.getvalue())
@@ -5546,137 +5884,57 @@ def main():
                     if df.empty:
                         st.warning("文件已解析但未找到有效数据行。请确认：表头为两行，且含「序号」「项目分级」「专业」「拟定金额」等列。")
                     else:
-                        st.success(f"已加载：{name}，共 {len(df)} 条记录")
-                        # 可选：将上传的 CSV 持久化为默认数据源，便于下次直接使用（需勾选开关）
-                        if suffix == ".csv" and update_backend:
-                            try:
-                                target_path = Path(DEFAULT_SINGLE_FILE)
-                                target_path.write_bytes(uploaded.getvalue())
-                                st.info(f"已将上传的CSV保存为默认数据源：{target_path.name}，后端数据已更新。")
-                            except Exception as e_save:
-                                st.warning(f"上传文件已加载，但保存到服务器失败：{e_save}")
-                        elif suffix != ".csv":
-                            st.info("当前上传的是 Excel 文件，仅在本次会话中使用，未覆盖默认CSV文件。")
+                        st.success(f"已解析：{name}，共 {len(df)} 条记录。")
+                        if st.button("✅ 将本次上传的数据保存为团队共享数据库（覆盖原有数据）", type="primary"):
+                            save_to_db(df)
+                            st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
+                            st.rerun()
                 except Exception as e:
                     st.error(f"解析失败：{e}")
                     import traceback
                     st.code(traceback.format_exc(), language=None)
-            if df.empty:
-                single_path = st.text_input("或填写本地文件路径（.csv / .xlsx）", value=DEFAULT_SINGLE_FILE)
+            if df.empty and df_db.empty:
+                single_path = st.text_input("或填写本地文件路径（.csv / .xlsx）并导入数据库", value=DEFAULT_SINGLE_FILE)
                 if single_path and Path(single_path).exists():
                     try:
                         df = load_uploaded(single_path, filename=Path(single_path).name)
-                        st.success(f"已从路径加载，共 {len(df)} 条记录")
+                        st.success(f"已从路径加载，共 {len(df)} 条记录。点击下方按钮保存到数据库。")
+                        if st.button("保存到数据库", key="save_from_path"):
+                            save_to_db(df)
+                            st.success("已保存到 SQLite 数据库。")
+                            st.rerun()
                     except Exception as e:
                         st.error(f"加载失败：{e}")
                 else:
                     st.info("请在上方上传 CSV/Excel，或填写有效的本地文件路径。")
-        else:
-            dir_path = st.text_input("数据目录路径", value=DEFAULT_DATA_DIR)
+            if df.empty and not df_db.empty:
+                df = df_db
+
+        else:  # 目录下全部 CSV（覆盖数据库）
+            dir_path = st.text_input("数据目录路径（导入并覆盖数据库）", value=DEFAULT_DATA_DIR)
             pattern = st.text_input("文件名匹配", value="*养老*进度*.csv")
             if dir_path and Path(dir_path).is_dir():
                 try:
                     df = load_from_directory(dir_path, pattern)
+                    if df.empty:
+                        st.warning("目录已扫描但未解析到有效数据，请检查文件名与表头格式。")
+                    else:
+                        st.success(f"已从目录加载，共 {len(df)} 条记录。")
+                        if st.button("✅ 将目录数据保存为团队共享数据库（覆盖原有数据）", type="primary"):
+                            save_to_db(df)
+                            st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
+                            st.rerun()
                 except Exception as e:
                     st.error(f"加载失败：{e}")
             else:
                 st.warning("请填写有效目录路径")
 
-        # 侧边栏：手动录入数据（按固定字段顺序，无需列名）
-        st.markdown("----")
-        manual_help = (
-            "一行一条记录，用英文逗号分隔字段，不需要列名。\n\n"
-            "字段顺序严格为：\n"
-            "1) 社区（园区，例如：燕园）\n"
-            "2) 项目名称（例如：燕园1号楼电梯更换）\n"
-            "3) 项目分级（例如：一级/二级/三级）\n"
-            "4) 专业（例如：电梯系统/供配电系统等）\n"
-            "5) 拟定金额（万元，数字，如：120 或 120.5）\n"
-            "6) 拟定承建组织（可留空）\n"
-            "7) 需求立项日期（可留空，如：2025-01-15）\n"
-            "8) 验收日期（可留空，如：2025-03-20）\n\n"
-            "示例：\n"
-            "燕园, 燕园1号楼电梯更换, 一级, 电梯系统, 120, XX工程公司, 2025-01-15, 2025-03-20\n"
-            "蜀园, 蜀园供配电系统改造, 二级, 供配电系统, 80, , 2025-02-01, \n\n"
-            "说明：\n"
-            "- 序号字段系统会自动生成，无需填写；\n"
-            "- 所属区域和城市将根据社区名称自动识别；\n"
-            "- 多条记录请分别写在多行。"
-        )
-        manual_text = st.text_area(
-            "手动输入数据（按固定字段顺序）",
-            value=st.session_state.get("manual_text", ""),
-            help=manual_help,
-        )
-        st.session_state["manual_text"] = manual_text
-        if manual_text.strip():
-            try:
-                lines = [ln.strip() for ln in manual_text.strip().splitlines() if ln.strip()]
-                rows = []
-                # 计算当前数据中已有的最大序号，用于续编号
-                current_max_seq = 0
-                if not df.empty and "序号" in df.columns:
-                    try:
-                        current_max_seq = int(pd.to_numeric(df["序号"], errors="coerce").max() or 0)
-                    except Exception:
-                        current_max_seq = 0
-                seq = current_max_seq
-                value_cols = ["园区", "项目名称", "项目分级", "专业", "拟定金额", "拟定承建组织", "需求立项", "验收(社区需求完成交付)"]
-                for line in lines:
-                    # 支持中英文逗号
-                    parts = [p.strip() for p in line.replace("，", ",").split(",")]
-                    if not any(parts):
-                        continue
-                    # 补齐或截断到固定列数
-                    if len(parts) < len(value_cols):
-                        parts += [""] * (len(value_cols) - len(parts))
-                    else:
-                        parts = parts[: len(value_cols)]
-                    seq += 1
-                    row = {"序号": seq}
-                    for col, val in zip(value_cols, parts):
-                        if col == "拟定金额":
-                            try:
-                                row[col] = float(val) if val not in ("", None) else 0
-                            except Exception:
-                                row[col] = 0
-                        else:
-                            row[col] = val
-                    rows.append(row)
-                if rows:
-                    manual_df = pd.DataFrame(rows)
-                    st.success(f"已从手动输入加载 {len(manual_df)} 条记录（序号已自动生成），这些记录会参与下方所有统计。")
-                else:
-                    manual_df = pd.DataFrame()
-            except Exception as e:
-                manual_df = pd.DataFrame()
-                st.error("手动输入数据解析失败，请检查每行是否为 8 个用逗号分隔的字段，且至少包含社区和项目名称。")
-
-        # 侧边栏：自定义数据输入框（文本）
-        st.markdown("---")
-        custom_note = st.text_area(
-            "补充说明 / 备注（可选）",
-            value=st.session_state.get("custom_note", ""),
-            help="可在此输入本次数据的备注说明、使用范围等信息，仅作为展示，不参与计算。",
-        )
-        st.session_state["custom_note"] = custom_note
-
-        # 合并文件/目录数据与手动输入数据
-        if not manual_df.empty:
-            if not df.empty:
-                df = pd.concat([df, manual_df], ignore_index=True)
-            else:
-                df = manual_df
-
         if not df.empty:
-            # 过滤掉 None 和空值，但保留其他值
             parks = df["园区"].dropna().unique().tolist()
-            # 过滤掉"未知园区"和无效值
             parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
             if parks:
                 园区选择 = st.multiselect("筛选园区", options=parks, default=parks)
             else:
-                st.warning("数据中未找到有效的园区信息，请检查数据文件。")
                 园区选择 = []
         else:
             园区选择 = []
@@ -5686,7 +5944,17 @@ def main():
         render_审核流程说明()
         return
 
-    # 自动添加城市和区域列
+    # 列名/列顺序规范化，再补齐关键列
+    df = _canonicalize_df(df)
+    df = _ensure_project_columns(df)
+
+    if not df.empty and len(df) > 10:
+        has_prof = "专业" in df.columns and df["专业"].astype(str).str.strip().str.len().gt(0).sum() > len(df) // 2
+        has_name = "项目名称" in df.columns and df["项目名称"].astype(str).str.strip().str.len().gt(0).sum() > len(df) // 2
+        if not has_prof or not has_name:
+            st.warning("当前数据中「专业」「项目名称」等列多为空，可能是旧库列对齐问题。请用侧边栏「上传文件（覆盖数据库）」重新上传 **改良改造报表-V4.csv** 并保存，即可修复显示。")
+
+    # 自动添加城市和区域列（用于地图与导出）
     df = _add_城市和区域列(df)
 
     # 导出按钮
@@ -5768,19 +6036,38 @@ def main():
     
     render_审核流程说明()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["项目统计分析", "地图与统计", "全部项目", "AI 助手"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["项目统计分析", "地图与统计", "全部项目（可在线编辑）", "新增/修改项目", "AI 助手"])
     with tab1:
         render_项目统计分析(df, 园区选择)
     with tab2:
         render_地图与统计(df, 园区选择)
     with tab3:
-        st.subheader("全部项目清单")
-        st.caption(f"共 {len(df)} 条项目，以下列出所有项目明细。")
-        # 显示时包含城市和区域列
-        display_cols = ["园区", "所属区域", "城市"] + [c for c in df.columns if c not in ["园区", "所属区域", "城市"]]
-        display_cols = [c for c in display_cols if c in df.columns]
-        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+        st.subheader("全部项目清单（可在线编辑）")
+        st.caption(f"共 {len(df)} 条项目。可在下表中直接增删改，点击下方按钮保存到数据库。")
+        base_order = [
+            "序号", "园区", "所属区域", "城市", "所属业态",
+            "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
+            "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+        ]
+        timeline_cols = [c for c in TIMELINE_COLS if c in df.columns]
+        extra_cols = ["上传凭证"] if "上传凭证" in df.columns else []
+        ordered_cols = [c for c in base_order + timeline_cols + extra_cols if c in df.columns]
+        df_edit = df[ordered_cols].copy()
+        edited_df = st.data_editor(
+            df_edit,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key="projects_editor",
+        )
+        if st.button("💾 保存所有更改到数据库（团队共享）", type="primary", key="save_editor"):
+            save_to_db(edited_df)
+            st.success("已保存到 SQLite 数据库。其他用户刷新页面后将看到最新数据。")
     with tab4:
+        st.subheader("项目录入 / 修改向导")
+        st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
+        _render_project_wizard(df)
+    with tab5:
         st.subheader("AI 助手（DeepSeek 驱动）")
         st.markdown(
             """
