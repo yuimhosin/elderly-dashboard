@@ -11,6 +11,8 @@ import io
 import base64
 import os
 import sqlite3
+import json
+import urllib.request
 from datetime import datetime
 from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask, TIMELINE_COLS
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
@@ -165,6 +167,224 @@ def _get_next_序号(df: pd.DataFrame) -> int:
         return int(m) + 1 if pd.notna(m) else 1
     except Exception:
         return 1
+
+
+# ---------- 飞书推送（自定义机器人 Webhook）----------
+def _get_feishu_webhook_url() -> str | None:
+    """获取飞书 Webhook URL：页内输入 > Streamlit Secrets > 环境变量 FEISHU_WEBHOOK_URL。"""
+    url = (st.session_state.get("feishu_webhook_url") or "").strip()
+    if url and url.startswith("https://"):
+        return url
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            for key in ("FEISHU_WEBHOOK_URL", "feishu_webhook_url"):
+                try:
+                    v = st.secrets[key]
+                    if v and str(v).strip().startswith("https://"):
+                        return str(v).strip()
+                except (KeyError, AttributeError, TypeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return os.getenv("FEISHU_WEBHOOK_URL") or None
+
+
+def _to_json_value(v):
+    """转为可 JSON 序列化的值（避免 numpy/NaN 导致请求体格式无效）。"""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    try:
+        if hasattr(v, "item"):  # numpy 标量
+            v = v.item()
+    except Exception:
+        return str(v)
+    if isinstance(v, float):
+        if v != v or v == float("inf") or v == float("-inf"):
+            return None
+        return int(v) if v == int(v) else v
+    if isinstance(v, (int, str, bool)):
+        return v
+    return str(v)
+
+
+def _row_to_dict(row: pd.Series) -> dict:
+    """将一行转为可 JSON 序列化的字典（键为字符串，值为原生类型）。"""
+    out = {}
+    for k, v in row.items():
+        out[str(k)] = _to_json_value(v)
+    return out
+
+
+def _format_cell(v) -> str:
+    """用于变更详情展示：None/NaN 显示为空字符串。"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return str(v).strip()
+
+
+def _compute_df_diff(old_df: pd.DataFrame, new_df: pd.DataFrame) -> dict:
+    """
+    按「序号」对比新旧表，返回删除、新增、修改的明细及修改详情（字段级 旧值→新值）。
+    返回：{"deleted": [], "added": [], "modified": [], "modified_details": [{序号, 变更项: ["列名: 旧→新"]}]}
+    """
+    out = {"deleted": [], "added": [], "modified": [], "modified_details": []}
+    if old_df.empty and new_df.empty:
+        return out
+    key_col = "序号"
+    if key_col not in old_df.columns or key_col not in new_df.columns:
+        return out
+    try:
+        old_df = old_df.dropna(subset=[key_col])
+        new_df = new_df.dropna(subset=[key_col])
+        old_df = old_df.astype({key_col: "float64"})
+        new_df = new_df.astype({key_col: "float64"})
+    except Exception:
+        return out
+    old_ids = set(old_df[key_col].astype(int).tolist())
+    new_ids = set(new_df[key_col].astype(int).tolist())
+    deleted_ids = old_ids - new_ids
+    added_ids = new_ids - old_ids
+    common_ids = old_ids & new_ids
+    for sid in deleted_ids:
+        row = old_df[old_df[key_col].astype(int) == sid].iloc[0]
+        out["deleted"].append(_row_to_dict(row))
+    for sid in added_ids:
+        row = new_df[new_df[key_col].astype(int) == sid].iloc[0]
+        out["added"].append(_row_to_dict(row))
+    for sid in common_ids:
+        old_row = old_df[old_df[key_col].astype(int) == sid].iloc[0]
+        new_row = new_df[new_df[key_col].astype(int) == sid].iloc[0]
+        if not old_row.equals(new_row):
+            out["modified"].append(_row_to_dict(new_row))
+            # 计算本条修改的字段级详情：列名 旧值→新值
+            changes = []
+            for col in old_row.index:
+                if col not in new_row.index:
+                    continue
+                ov = _format_cell(old_row[col])
+                nv = _format_cell(new_row[col])
+                if ov != nv:
+                    changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
+            out["modified_details"].append({"序号": int(sid), "变更项": changes})
+    return out
+
+
+def _build_feishu_payload_from_diff(diff: dict, total_after: int, source: str = "看板编辑") -> dict:
+    """根据 diff 构建飞书 Webhook 的 JSON 负载（含变更类型、修改内容及修改详情），全部为可序列化类型。"""
+    n_del = int(len(diff["deleted"]))
+    n_add = int(len(diff["added"]))
+    n_mod = int(len(diff["modified"]))
+    modified_details = diff.get("modified_details") or []
+    total_after = int(total_after)
+    parts = []
+    if n_del:
+        parts.append(f"删除 {n_del} 条")
+    if n_mod:
+        parts.append(f"修改 {n_mod} 条")
+    if n_add:
+        parts.append(f"新增 {n_add} 条")
+    summary_text = "、".join(parts) if parts else "无结构变更"
+    text = f"【养老社区进度表】{source}：{summary_text}，当前共 {total_after} 条记录。"
+    # 追加修改详情：每条记录的字段级变更（如 总部重点关注项目：是 → 否）
+    if modified_details:
+        detail_lines = []
+        for item in modified_details:
+            seq = item.get("序号", "")
+            changes = item.get("变更项") or []
+            if changes:
+                detail_lines.append(f"序号 {seq}：" + "；".join(changes))
+        if detail_lines:
+            text += "\n修改详情：\n" + "\n".join(detail_lines)
+    change_type = "mixed" if (n_del and n_add) or (n_del and n_mod) or (n_add and n_mod) else ("delete" if n_del and not n_add and not n_mod else ("add" if n_add and not n_del and not n_mod else "modify"))
+    # 飞书流程要求：大括号 {}、message_type 为文本类型、键值对（键字符串，值可字符串/数字/布尔/数组/对象/null）
+    payload = {
+        "message_type": "text",
+        "text": text,
+        "change_type": change_type,
+        "deleted_count": n_del,
+        "added_count": n_add,
+        "modified_count": n_mod,
+        "total_after": total_after,
+        "changes": {
+            "deleted": diff["deleted"],
+            "added": diff["added"],
+            "modified": diff["modified"],
+        },
+    }
+    if modified_details:
+        payload["modified_details"] = modified_details
+    return payload
+
+
+def _ensure_native_json(obj):
+    """递归将 dict/list 中的值转为可 JSON 序列化的原生类型，避免请求体格式无效。"""
+    if obj is None or isinstance(obj, (bool, str)):
+        return obj
+    if isinstance(obj, (int, float)):
+        if isinstance(obj, float) and (obj != obj or abs(obj) == float("inf")):
+            return None
+        return int(obj) if isinstance(obj, float) and obj == int(obj) else obj
+    if hasattr(obj, "item"):
+        try:
+            return _ensure_native_json(obj.item())
+        except Exception:
+            return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _ensure_native_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_ensure_native_json(x) for x in obj]
+    return str(obj)
+
+
+def push_to_feishu(text: str | None = None, payload: dict | None = None) -> bool:
+    """向飞书 Webhook 推送。payload 会先做原生类型清理再发送，避免请求体格式无效。"""
+    url = _get_feishu_webhook_url()
+    if not url:
+        return False
+    if payload is not None:
+        body_dict = _ensure_native_json(payload)
+        # 飞书流程要求 message_type + 键值对；若设 FEISHU_PAYLOAD_SIMPLE=1 则只发扁平键值对，changes 转为 changes_json 字符串
+        if os.getenv("FEISHU_PAYLOAD_SIMPLE", "").strip() in ("1", "true", "True"):
+            _modified_details = body_dict.get("modified_details")
+            body_dict = {
+                "message_type": "text",
+                "text": body_dict.get("text") or "",
+                "change_type": body_dict.get("change_type", ""),
+                "deleted_count": body_dict.get("deleted_count", 0),
+                "added_count": body_dict.get("added_count", 0),
+                "modified_count": body_dict.get("modified_count", 0),
+                "total_after": body_dict.get("total_after", 0),
+                "changes_json": json.dumps(body_dict.get("changes") or {}, ensure_ascii=False, default=str),
+            }
+            if _modified_details:
+                body_dict["modified_details"] = _modified_details
+        elif body_dict.get("message_type") is None and body_dict.get("msg_type") is not None:
+            body_dict["message_type"] = "text"
+    elif text and str(text).strip():
+        body_dict = {"message_type": "text", "text": text.strip()}
+    else:
+        return False
+    # 调试：在终端打印本次推送的 text，便于确认是否含修改详情（若仍只看到旧文案，请检查飞书流程是否引用 text 参数）
+    _msg = body_dict.get("text") or ""
+    if _msg and os.getenv("FEISHU_DEBUG_TEXT"):
+        print("[飞书推送] text:", _msg[:200] + ("..." if len(_msg) > 200 else ""))
+    try:
+        body = json.dumps(body_dict, ensure_ascii=False, default=str).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json; charset=utf-8"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode())
+                return data.get("StatusCode") == 0 or data.get("code") == 0
+    except Exception:
+        pass
+    return False
 
 
 @st.cache_data(ttl=300)
@@ -5385,15 +5605,20 @@ def _get_deepseek_api_key(provided: str | None = None) -> str | None:
     key = st.session_state.get("deepseek_api_key") or ""
     if key and str(key).strip():
         return str(key).strip()
-    # Streamlit Secrets：键不存在时会抛错，需 try/except；TOML 中键名可用大写或小写
-    if hasattr(st, "secrets") and st.secrets:
-        for secret_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
-            try:
-                val = st.secrets[secret_key]
-                if val and str(val).strip():
-                    return str(val).strip()
-            except (KeyError, AttributeError, TypeError):
-                continue
+    # Streamlit Secrets：无 secrets.toml 时会 FileNotFoundError，键不存在会 KeyError
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            for secret_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
+                try:
+                    val = st.secrets[secret_key]
+                    if val and str(val).strip():
+                        return str(val).strip()
+                except (KeyError, AttributeError, TypeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
     return os.getenv("DEEPSEEK_API_KEY") or None
 
 
@@ -5643,29 +5868,44 @@ def _render_project_wizard(df: pd.DataFrame):
 
     if mode == "修改已有项目":
         st.markdown("### 步骤 1：查找要修改的项目")
-        col1, col2 = st.columns(2)
+        # 排除的列：地区、社区、序号（以及“所属区域”视为地区）
+        exclude_search_cols = {"序号", "地区", "社区", "所属区域"}
+        searchable_cols = [c for c in df_all.columns if c not in exclude_search_cols]
+        if not searchable_cols:
+            searchable_cols = ["园区", "项目名称", "项目分级", "专业"]
+
+        parks = sorted(df_all["园区"].dropna().astype(str).unique().tolist())
+        parks = [p for p in parks if p and p.strip()]
+        if not parks:
+            parks = sorted(set(园区_TO_城市.keys()))
+
+        col1, col2, col3 = st.columns(3)
         with col1:
-            seq_input = st.text_input("按序号查找（可选）", value="", placeholder="例如：12")
+            园区选择 = st.selectbox("选择园区", options=[""] + parks, format_func=lambda x: x if x else "请选择园区")
         with col2:
-            name_kw = st.text_input("按项目名称关键词查找（可选）", value="", placeholder="例如：配电、外立面等")
+            查找字段 = st.selectbox("按字段查找", options=[""] + searchable_cols, format_func=lambda x: x if x else "请选择字段")
+        with col3:
+            查找关键词 = st.text_input("查找关键词", value="", placeholder="输入关键词进行模糊匹配")
 
         target_row = None
-        if not seq_input.strip() and not name_kw.strip():
-            st.info("请先输入序号或项目名称关键词，然后回车进行查找。")
+        if not 园区选择:
+            st.info("请先选择园区，再选择查找字段并输入关键词完成查询。")
             return
 
-        candidates = df_raw
-        if seq_input.strip():
-            try:
-                seq_val = int(float(seq_input.strip()))
-                candidates = candidates[pd.to_numeric(candidates["序号"], errors="coerce") == seq_val]
-            except ValueError:
-                candidates = candidates.iloc[0:0]
-        if name_kw.strip():
-            candidates = candidates[candidates["项目名称"].astype(str).str.contains(name_kw.strip(), na=False)]
+        candidates = df_all[df_all["园区"].astype(str) == 园区选择].copy()
+        if candidates.empty:
+            st.info("该园区下暂无项目，可切换园区或切换到“新增项目”。")
+            return
+
+        if 查找字段 and 查找关键词.strip():
+            col_series = candidates[查找字段].astype(str)
+            candidates = candidates[col_series.str.contains(查找关键词.strip(), na=False)]
+        elif 查找字段 and not 查找关键词.strip():
+            st.info("已按园区筛选，请输入查找关键词或直接在下拉中选择要修改的项目。")
+        # 若未选字段：仅按园区展示全部，允许直接选序号
 
         if candidates.empty:
-            st.info("未找到匹配项目，可切换到“新增项目”，或调整查找条件。")
+            st.info("未找到匹配项目，请调整查找关键词或切换园区。")
             return
 
         st.caption(f"找到 {len(candidates)} 条记录，请选择一条进行修改：")
@@ -5679,6 +5919,8 @@ def _render_project_wizard(df: pd.DataFrame):
 
         st.markdown("---")
         st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
+        if _get_feishu_webhook_url():
+            st.info("修改的内容会被推送到飞书。")
 
         with st.form("edit_project_form"):
             st.markdown("**基础信息**")
@@ -5741,6 +5983,10 @@ def _render_project_wizard(df: pd.DataFrame):
         if delete_clicked:
             df_new = df_all[df_all["序号"].astype(int) != seq_val].copy()
             save_to_db(df_new)
+            if _get_feishu_webhook_url():
+                diff = {"deleted": [_row_to_dict(target_row)], "added": [], "modified": []}
+                payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导删除")
+                push_to_feishu(payload=payload)
             st.success(f"已删除序号为 {seq_val} 的项目。")
             st.rerun()
 
@@ -5769,6 +6015,26 @@ def _render_project_wizard(df: pd.DataFrame):
                 if col in df_new.columns:
                     df_new.loc[mask, col] = val
             save_to_db(df_new)
+            if _get_feishu_webhook_url():
+                modified_row = df_new.loc[mask].iloc[0]
+                # 计算字段级修改详情（如 总部重点关注项目：是 → 否）
+                changes = []
+                for col in target_row.index:
+                    if col not in modified_row.index:
+                        continue
+                    ov = _format_cell(target_row[col])
+                    nv = _format_cell(modified_row[col])
+                    if ov != nv:
+                        changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
+                modified_details = [{"序号": seq_val, "变更项": changes}]
+                diff = {
+                    "deleted": [],
+                    "added": [],
+                    "modified": [_row_to_dict(modified_row)],
+                    "modified_details": modified_details,
+                }
+                payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改")
+                push_to_feishu(payload=payload)
             st.success("已保存修改。")
             st.rerun()
         return
@@ -5857,6 +6123,10 @@ def _render_project_wizard(df: pd.DataFrame):
         df_new_row = pd.DataFrame([form_dict])
         df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
         save_to_db(df_all2)
+        if _get_feishu_webhook_url():
+            diff = {"deleted": [], "added": [_row_to_dict(df_new_row.iloc[0])], "modified": []}
+            payload = _build_feishu_payload_from_diff(diff, len(df_all2), source="向导新增")
+            push_to_feishu(payload=payload)
         st.success(f"已写入数据库。上传凭证：{token}")
         st.info("请截图或记录该凭证号，后续如需确认或审计可用于检索。")
         st.rerun()
@@ -5886,7 +6156,13 @@ def main():
                         df = load_single_csv(str(default_csv))
                         if not df.empty:
                             save_to_db(df)
-                            st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。")
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已用「改良改造报表-V4.csv」初始化，共 {len(df)} 条记录。"):
+                                    st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
+                                else:
+                                    st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                            else:
+                                st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。")
                         else:
                             st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
                     except Exception as e:
@@ -5919,7 +6195,13 @@ def main():
                         st.success(f"已解析：{name}，共 {len(df)} 条记录。")
                         if st.button("✅ 将本次上传的数据保存为团队共享数据库（覆盖原有数据）", type="primary"):
                             save_to_db(df)
-                            st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（上传文件：{name}）"):
+                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                                else:
+                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                            else:
+                                st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
                             st.rerun()
                 except Exception as e:
                     st.error(f"解析失败：{e}")
@@ -5933,7 +6215,13 @@ def main():
                         st.success(f"已从路径加载，共 {len(df)} 条记录。点击下方按钮保存到数据库。")
                         if st.button("保存到数据库", key="save_from_path"):
                             save_to_db(df)
-                            st.success("已保存到 SQLite 数据库。")
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（本地路径导入）"):
+                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                                else:
+                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                            else:
+                                st.success("已保存到 SQLite 数据库。")
                             st.rerun()
                     except Exception as e:
                         st.error(f"加载失败：{e}")
@@ -5954,12 +6242,29 @@ def main():
                         st.success(f"已从目录加载，共 {len(df)} 条记录。")
                         if st.button("✅ 将目录数据保存为团队共享数据库（覆盖原有数据）", type="primary"):
                             save_to_db(df)
-                            st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（目录导入）"):
+                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                                else:
+                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                            else:
+                                st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
                             st.rerun()
                 except Exception as e:
                     st.error(f"加载失败：{e}")
             else:
                 st.warning("请填写有效目录路径")
+
+        st.markdown("---")
+        with st.expander("飞书推送", expanded=False):
+            st.caption("保存到数据库时会自动推送通知到飞书群。需先在飞书群添加「自定义机器人」并复制 Webhook 地址。")
+            st.text_input(
+                "飞书机器人 Webhook URL",
+                key="feishu_webhook_url",
+                type="password",
+                placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...",
+                help="也可用环境变量 FEISHU_WEBHOOK_URL 或 Streamlit Secrets 配置。",
+            )
 
         if not df.empty:
             parks = df["园区"].dropna().unique().tolist()
@@ -5989,83 +6294,6 @@ def main():
     # 自动添加城市和区域列（用于地图与导出）
     df = _add_城市和区域列(df)
 
-    # 导出按钮
-    col1, col2, col3 = st.columns([1, 1, 4])
-    with col1:
-        if st.button("📄 导出PDF报告", type="primary", use_container_width=True):
-            try:
-                with st.spinner("正在生成PDF报告，请稍候..."):
-                    pdf_path = generate_pdf_report(df, 园区选择)
-                    with open(pdf_path, "rb") as pdf_file:
-                        pdf_bytes = pdf_file.read()
-                    st.success("PDF报告生成成功！")
-                    st.download_button(
-                        label="⬇️ 下载PDF报告",
-                        data=pdf_bytes,
-                        file_name=f"养老社区改良改造进度管理报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-            except ImportError as e:
-                st.error(f"PDF导出功能需要安装依赖库：{e}")
-                st.info("请运行：pip install weasyprint 或 pip install playwright && playwright install chromium")
-            except Exception as e:
-                st.error(f"生成PDF报告失败：{e}")
-                import traceback
-                st.code(traceback.format_exc(), language=None)
-    with col2:
-        if st.button("💾 保存HTML文件", use_container_width=True):
-            try:
-                with st.spinner("正在生成HTML文件，请稍候..."):
-                    # 处理园区选择
-                    if 园区选择 and len(园区选择) > 0:
-                        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
-                        if valid_parks:
-                            sub = df[df["园区"].isin(valid_parks)]
-                        else:
-                            sub = df[df["园区"].notna()]
-                    else:
-                        sub = df[df["园区"].notna()]
-                    
-                    # 过滤汇总行
-                    if "序号" in sub.columns:
-                        sub = sub[sub["序号"].notna()]
-                        sub = sub[~sub["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
-                        sub = sub[pd.to_numeric(sub["序号"], errors='coerce').notna()]
-                    
-                    # 添加城市和区域列
-                    df_with_location = _add_城市和区域列(df)
-                    if 园区选择 and len(园区选择) > 0:
-                        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
-                        if valid_parks:
-                            sub_location = df_with_location[df_with_location["园区"].isin(valid_parks)]
-                        else:
-                            sub_location = df_with_location[df_with_location["园区"].notna()]
-                    else:
-                        sub_location = df_with_location[df_with_location["园区"].notna()]
-                    
-                    if "序号" in sub_location.columns:
-                        sub_location = sub_location[sub_location["序号"].notna()]
-                        sub_location = sub_location[~sub_location["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
-                        sub_location = sub_location[pd.to_numeric(sub_location["序号"], errors='coerce').notna()]
-                    
-                    # 生成HTML内容
-                    html_content = generate_html_report(df, sub, sub_location, 园区选择)
-                    
-                    st.success("HTML文件生成成功！")
-                    st.download_button(
-                        label="⬇️ 下载HTML文件",
-                        data=html_content.encode('utf-8'),
-                        file_name=f"养老社区改良改造进度管理报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
-                        mime="text/html",
-                        use_container_width=True
-                    )
-                    st.info("💡 提示：HTML文件包含所有图表和数据，可以在任何设备上离线打开查看。")
-            except Exception as e:
-                st.error(f"生成HTML文件失败：{e}")
-                import traceback
-                st.code(traceback.format_exc(), language=None)
-    
     render_审核流程说明()
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["项目统计分析", "地图与统计", "全部项目（可在线编辑）", "新增/修改项目", "AI 助手"])
@@ -6093,8 +6321,17 @@ def main():
             key="projects_editor",
         )
         if st.button("💾 保存所有更改到数据库（团队共享）", type="primary", key="save_editor"):
+            old_df = load_from_db()
+            diff = _compute_df_diff(old_df, edited_df)
             save_to_db(edited_df)
-            st.success("已保存到 SQLite 数据库。其他用户刷新页面后将看到最新数据。")
+            if _get_feishu_webhook_url():
+                payload = _build_feishu_payload_from_diff(diff, len(edited_df), source="看板编辑")
+                if push_to_feishu(payload=payload):
+                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                else:
+                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+            else:
+                st.success("已保存到 SQLite 数据库。其他用户刷新页面后将看到最新数据。")
     with tab4:
         st.subheader("项目录入 / 修改向导")
         st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
@@ -6104,15 +6341,8 @@ def main():
         st.markdown(
             """
             这个 AI 窗口用于：**使用说明**、**查询与筛选建议**（如“帮我查找三月立项的项目”）。  
-            请在下方填写 DeepSeek API Key 后即可对话（仅存于当前会话，不会上传）。
+            需在 `.streamlit/secrets.toml` 或环境变量中配置 `DEEPSEEK_API_KEY` 后即可对话。
             """
-        )
-        st.text_input(
-            "DeepSeek API Key",
-            type="password",
-            placeholder="sk-...（可从 https://platform.deepseek.com 获取）",
-            help="填写后即可使用。Secrets：在项目根目录建 .streamlit/secrets.toml，内容写 DEEPSEEK_API_KEY = \"sk-xxx\"，然后重启 Streamlit。",
-            key="deepseek_api_key",
         )
         api_key = _get_deepseek_api_key()
 
