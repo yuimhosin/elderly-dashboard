@@ -171,10 +171,8 @@ def _get_next_序号(df: pd.DataFrame) -> int:
 
 # ---------- 飞书推送（自定义机器人 Webhook）----------
 def _get_feishu_webhook_url() -> str | None:
-    """获取飞书 Webhook URL：页内输入 > Streamlit Secrets > 环境变量 FEISHU_WEBHOOK_URL。"""
-    url = (st.session_state.get("feishu_webhook_url") or "").strip()
-    if url and url.startswith("https://"):
-        return url
+    """获取飞书 Webhook URL：Secrets/环境变量优先（保证部署后能推送），再读侧栏输入。"""
+    # 1) 优先 Secrets（.streamlit/secrets.toml 或 Cloud 配置）
     try:
         if hasattr(st, "secrets") and st.secrets:
             for key in ("FEISHU_WEBHOOK_URL", "feishu_webhook_url"):
@@ -188,7 +186,16 @@ def _get_feishu_webhook_url() -> str | None:
         pass
     except Exception:
         pass
-    return os.getenv("FEISHU_WEBHOOK_URL") or None
+    # 2) 环境变量
+    for env_key in ("FEISHU_WEBHOOK_URL", "feishu_webhook_url"):
+        env_url = os.getenv(env_key)
+        if env_url and str(env_url).strip().startswith("https://"):
+            return str(env_url).strip()
+    # 3) 侧栏输入（未展开时可能为空）
+    url = (st.session_state.get("feishu_webhook_url") or "").strip()
+    if url and url.startswith("https://"):
+        return url
+    return None
 
 
 def _to_json_value(v):
@@ -5599,13 +5606,10 @@ def generate_pdf_report(df: pd.DataFrame, 园区选择: list, output_path: str =
 
 
 def _get_deepseek_api_key(provided: str | None = None) -> str | None:
-    """获取 DeepSeek API Key：优先使用传入值，否则 session_state、Streamlit Secrets、环境变量。"""
+    """获取 DeepSeek API Key：Secrets/环境变量优先（Cloud 部署可靠），再读侧栏/传入值。"""
     if provided and str(provided).strip():
         return str(provided).strip()
-    key = st.session_state.get("deepseek_api_key") or ""
-    if key and str(key).strip():
-        return str(key).strip()
-    # Streamlit Secrets：无 secrets.toml 时会 FileNotFoundError，键不存在会 KeyError
+    # 1) Streamlit Secrets 优先（Cloud 上在 Settings → Secrets 里填）
     try:
         if hasattr(st, "secrets") and st.secrets:
             for secret_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
@@ -5619,7 +5623,16 @@ def _get_deepseek_api_key(provided: str | None = None) -> str | None:
         pass
     except Exception:
         pass
-    return os.getenv("DEEPSEEK_API_KEY") or None
+    # 2) 环境变量
+    for env_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
+        v = os.getenv(env_key)
+        if v and str(v).strip():
+            return str(v).strip()
+    # 3) 侧栏/当前页输入
+    key = (st.session_state.get("deepseek_api_key") or "").strip()
+    if key:
+        return key
+    return None
 
 
 def _get_deepseek_client(api_key: str | None = None):
@@ -5643,8 +5656,8 @@ def _answer_with_deepseek(api_key: str | None, question: str, df: pd.DataFrame) 
     if client is None:
         return (
             "未检测到可用的 DeepSeek 客户端。\n\n"
-            "请在左侧或当前页中正确填写 DeepSeek API Key（建议使用 Streamlit Secrets 或环境变量），"
-            "或联系管理员配置后再重试。"
+            "请在左侧或当前页填写 DeepSeek API Key；若使用 **Streamlit Secrets**，在 Secrets 中配置：\n"
+            "`DEEPSEEK_API_KEY = \"sk-...\"` 或 `deepseek_api_key = \"sk-...\"`，保存后重新部署。"
         )
     # 只提供列信息，不传输完整数据
     cols = list(df.columns)[:30]
@@ -6256,14 +6269,14 @@ def main():
                 st.warning("请填写有效目录路径")
 
         st.markdown("---")
-        with st.expander("飞书推送", expanded=False):
-            st.caption("保存到数据库时会自动推送通知到飞书群。需先在飞书群添加「自定义机器人」并复制 Webhook 地址。")
+        with st.expander("飞书推送", expanded=True):
+            st.caption("保存到数据库时会自动推送通知到飞书群。需先在飞书群添加「自定义机器人」并复制 Webhook 地址。配置 Webhook 后无需勾选，保存即推送。")
             st.text_input(
                 "飞书机器人 Webhook URL",
                 key="feishu_webhook_url",
                 type="password",
                 placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...",
-                help="也可用环境变量 FEISHU_WEBHOOK_URL 或 Streamlit Secrets 配置。",
+                help="本页填写、或 .streamlit/secrets.toml 中 feishu_webhook_url、或环境变量 FEISHU_WEBHOOK_URL，任一配置即可。",
             )
 
         if not df.empty:
@@ -6341,7 +6354,7 @@ def main():
         st.markdown(
             """
             这个 AI 窗口用于：**使用说明**、**查询与筛选建议**（如“帮我查找三月立项的项目”）。  
-            需在 `.streamlit/secrets.toml` 或环境变量中配置 `DEEPSEEK_API_KEY` 后即可对话。
+            在下方填写 API Key，或在 Streamlit Secrets / 环境变量中配置 `DEEPSEEK_API_KEY` 或 `deepseek_api_key` 后即可对话。
             """
         )
         api_key = _get_deepseek_api_key()
