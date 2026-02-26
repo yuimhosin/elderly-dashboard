@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import io
 import base64
+import os
 from datetime import datetime
 from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
@@ -5274,13 +5275,15 @@ def generate_pdf_report(df: pd.DataFrame, 园区选择: list, output_path: str =
     return generate_pdf_report_html(df, 园区选择, output_path)
 
 
-def _get_deepseek_client(api_key: str | None):
-    """构造 DeepSeek 客户端。"""
-    if not (DEEPSEEK_CLIENT_AVAILABLE and api_key):
+def _get_deepseek_client(api_key: str | None = None):
+    """构造 DeepSeek 客户端，优先使用环境变量 DEEPSEEK_API_KEY。"""
+    env_key = os.getenv("DEEPSEEK_API_KEY")
+    final_key = api_key or env_key
+    if not (DEEPSEEK_CLIENT_AVAILABLE and final_key):
         return None
     try:
         client = OpenAI(
-            api_key=api_key,
+            api_key=final_key,
             base_url="https://api.deepseek.com",
         )
         return client
@@ -5783,17 +5786,15 @@ def main():
             """
             这个 AI 窗口用于：\n
             - 解答本网页的 **使用说明**（如如何上传数据、如何手动录入、各个标签页含义等）；\n
-            - 帮你根据当前已加载的数据给出 **查询与筛选的建议**（例如：“帮我查找三月立项的项目”）。\n
+            - 帮你根据当前已加载的数据给出 **查询与筛选的建议**（例如：“帮我查找三月立项的项目”）。\n\n
+            使用方式：\n
+            - 请在运行环境中设置环境变量 `DEEPSEEK_API_KEY`，例如：\n
+              - Windows PowerShell: `$env:DEEPSEEK_API_KEY=\"你的密钥\"`\n
+              - Linux / macOS: `export DEEPSEEK_API_KEY=\"你的密钥\"`\n
+            - 设置完成后，无需在页面内输入密钥，直接在下方对话框提问即可。
             """
         )
-        # DeepSeek API Key 输入（不在代码中硬编码，避免泄露）
-        api_key = st.text_input(
-            "DeepSeek API Key（仅本次会话使用）",
-            type="password",
-            value=st.session_state.get("deepseek_api_key", ""),
-            help="出于安全考虑，建议通过环境变量或 Streamlit Secrets 配置，在公开仓库中不要硬编码密钥。",
-        )
-        st.session_state["deepseek_api_key"] = api_key
+        api_key = os.getenv("DEEPSEEK_API_KEY")
 
         if "ai_messages" not in st.session_state:
             st.session_state["ai_messages"] = [

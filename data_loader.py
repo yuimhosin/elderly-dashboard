@@ -169,43 +169,26 @@ def _load_flat_progress_csv(path: Path) -> pd.DataFrame:
     is_new_format = path.name == "改良改造报表-V4.csv"
     
     if is_new_format:
-        # 新格式：第一行是列名（可能乱码），第二行是空行，第三行开始是数据
-        # 根据列的位置映射列名
-        df = pd.read_csv(path, header=None, skiprows=2, encoding=encoding, low_memory=False)
-        # 根据位置映射列名（基于实际数据结构）
-        column_mapping = {
-            0: "序号",
-            1: "园区",
-            2: "城市",
-            3: "所属区域",
-            4: "项目业态",
-            5: "项目分级",
-            6: "项目分类",
-            7: "拟定承建组织",
-            8: "总部重点关注项目",
-            9: "专业",
-            10: "专业细分",
-            11: "项目名称",
-            12: "备注说明",
-            13: "拟定金额"
-        }
-        header = []
-        for i in range(df.shape[1]):
-            if i in column_mapping:
-                header.append(column_mapping[i])
-            else:
-                header.append(f"列{i+1}")
-        df.columns = header[:df.shape[1]]
-        
-        # 添加"专业分包"作为"专业细分"的别名
-        if "专业细分" in df.columns and "专业分包" not in df.columns:
-            df["专业分包"] = df["专业细分"]
-        
-        # 确保关键列的数据类型正确
-        if "序号" in df.columns:
-            df["序号"] = pd.to_numeric(df["序号"], errors='coerce')
-        if "拟定金额" in df.columns:
-            df["拟定金额"] = pd.to_numeric(df["拟定金额"], errors='coerce').fillna(0)
+        # 改良改造报表-V4.csv：表头两行后为数据，严格按列位置读取前 14 列，避免多列/错位导致后面列读不出
+        # 源表顺序：序号,社区,所属区域,所在城市,所属业态,项目分级,项目分类,拟定承建组织,总部重点关注项目,专业,专业分包,项目名称,备注说明,拟定金额
+        CANONICAL_14 = [
+            "序号", "社区", "所属区域", "城市", "所属业态",
+            "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
+            "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+        ]
+        df = pd.read_csv(
+            path, header=None, skiprows=2, encoding=encoding,
+            low_memory=False, dtype=str, keep_default_na=False,
+        )
+        # 只保留前 14 列，按位置赋列名，不依赖 CSV 列数
+        n = min(14, df.shape[1])
+        df = df.iloc[:, :n].copy()
+        df.columns = CANONICAL_14[:n]
+        if n < 14:
+            for c in CANONICAL_14[n:]:
+                df[c] = ""
+        # 拟定金额、序号转数值；社区→园区等
+        df = _normalize_loaded_df(df, 园区名=None, default_园区_from=path.stem)
     else:
         # 原有格式处理
         # 检查第一行是否是列名：如果包含"序号"、"园区"、"社区"等关键词，则认为是列名

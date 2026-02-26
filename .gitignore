@@ -1,0 +1,46 @@
+# 环境与密钥
+.env
+*.env
+!env_example.txt
+!*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+.venv/
+venv/
+ENV/
+
+# 构建与分发
+build/
+dist/
+*.spec
+*.egg-info/
+*.egg
+
+# 数据库与本地数据（可选：若需提交可移除）
+*.db
+*.sqlite
+*.sqlite3
+
+# 临时与备份
+*.backup
+*.bak
+*.log
+*.tmp
+Untitled
+
+# 压缩包与二进制
+*.zip
+*.rar
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
