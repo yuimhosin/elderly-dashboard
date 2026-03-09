@@ -28,6 +28,9 @@ dist/
 *.sqlite
 *.sqlite3
 
+# 飞书 RAG 向量库（含同步的文档内容，勿提交）
+feishu-rag/vector_db/
+
 # 临时与备份
 *.backup
 *.bak

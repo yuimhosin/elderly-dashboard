@@ -1,0 +1,21 @@
+# Feishu RAG - DeepSeek only, local embedding (no OpenAI)
+# Copy to .env and fill in
+
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=xxx
+FEISHU_DOC_IDS=https://xxx.feishu.cn/wiki/xxx
+
+# 文档分享授权码（可选）：保密文档/仅链接可访问时，填写分享时获得的 pt-xxx 授权码
+# FEISHU_PERMISSION_TOKEN=pt-xxx
+
+# DeepSeek for LLM (required)
+DEEPSEEK_API_KEY=sk-xxx
+# DEEPSEEK_MODEL=deepseek-chat
+
+# Local embedding model (optional, default BAAI/bge-small-zh-v1.5)
+# FEISHU_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+# FEISHU_RAG_TOP_K=15
+# FEISHU_RAG_TOP_K_LIST=50
+
+# Agentic RAG：Agent 自动选择 RAG 检索或统计分析（需 langgraph）
+# FEISHU_AGENTIC_RAG=1
