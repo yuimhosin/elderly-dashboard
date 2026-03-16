@@ -47,20 +47,51 @@ def _get_tenant_access_token() -> Optional[str]:
     return None
 
 
-def _parse_bitable_url(url_or_id: str) -> tuple[str, str]:
+def _parse_bitable_url(url_or_id: str) -> tuple[str, str, bool]:
     """
     从飞书多维表格 URL 解析 app_token 和 table_id。
-    支持：https://xxx.feishu.cn/base/AppToken 或 https://xxx.feishu.cn/base/AppToken?table=TableId
-    返回 (app_token, table_id)，table_id 可能为空。
+    支持：
+    - base 格式：https://xxx.feishu.cn/base/AppToken 或 ?table=TableId
+    - wiki 格式：https://xxx.feishu.cn/wiki/NodeToken?table=TableId
+    返回 (app_token, table_id, is_wiki)，table_id 可能为空；is_wiki 表示需通过 wiki API 解析 app_token。
     """
     s = (url_or_id or "").strip()
-    m = re.search(r"base/([A-Za-z0-9]+)", s)
-    if not m:
-        return "", ""
-    app_token = m.group(1)
     table_m = re.search(r"[?&]table=([A-Za-z0-9]+)", s)
     table_id = table_m.group(1) if table_m else ""
-    return app_token, table_id
+
+    m_base = re.search(r"base/([A-Za-z0-9]+)", s)
+    if m_base:
+        return m_base.group(1), table_id, False
+
+    m_wiki = re.search(r"wiki/([A-Za-z0-9]+)", s)
+    if m_wiki and table_id:
+        return m_wiki.group(1), table_id, True
+
+    return "", "", False
+
+
+def _get_app_token_from_wiki_node(node_token: str) -> Optional[str]:
+    """通过 wiki get_node API 获取 bitable 的 app_token。"""
+    token = _get_tenant_access_token()
+    if not token:
+        return None
+    url = f"{FEISHU_API_BASE}/wiki/v2/spaces/get_node?token={node_token}"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("code") != 0:
+                return None
+            d = data.get("data", {}).get("node", {})
+            if d.get("obj_type") == "bitable":
+                return d.get("obj_token")
+    except Exception:
+        pass
+    return None
 
 
 def _get_first_table_id(app_token: str) -> Optional[str]:
@@ -109,15 +140,22 @@ def _flatten_field_value(v) -> str:
 def load_from_bitable(url_or_id: str) -> pd.DataFrame:
     """
     从飞书多维表格加载数据为 DataFrame。
-    url_or_id: 飞书多维表格链接，如 https://xxx.feishu.cn/base/AppToken 或含 ?table=TableId
+    url_or_id: 飞书多维表格链接，支持：
+    - base 格式：https://xxx.feishu.cn/base/AppToken 或含 ?table=TableId
+    - wiki 格式：https://xxx.feishu.cn/wiki/NodeToken?table=TableId
     需配置环境变量 FEISHU_APP_ID、FEISHU_APP_SECRET。
     """
     token = _get_tenant_access_token()
     if not token:
         return pd.DataFrame()
 
-    app_token, table_id = _parse_bitable_url(url_or_id)
-    if not app_token:
+    parsed = _parse_bitable_url(url_or_id)
+    app_token, table_id, is_wiki = parsed[0], parsed[1], parsed[2]
+    if is_wiki:
+        app_token = _get_app_token_from_wiki_node(app_token)
+        if not app_token:
+            return pd.DataFrame()
+    elif not app_token:
         return pd.DataFrame()
 
     if not table_id:

@@ -23,6 +23,11 @@ try:
 except ImportError:
     FEISHU_BITABLE_AVAILABLE = False
 
+try:
+    from feishu_oauth import build_authorize_url, exchange_code_for_user
+    FEISHU_OAUTH_AVAILABLE = True
+except ImportError:
+    FEISHU_OAUTH_AVAILABLE = False
 
 try:
     from openai import OpenAI
@@ -5408,8 +5413,38 @@ def _render_project_wizard(df: pd.DataFrame):
 
 
 def _require_feishu_login() -> bool:
-    """登录门禁（已关闭）。"""
-    return True
+    """登录门禁：当 FEISHU_LOGIN_REQUIRED=1 时，未登录用户需通过飞书 OAuth 登录后才能访问。"""
+    if str(os.getenv("FEISHU_LOGIN_REQUIRED", "0")).strip() != "1":
+        return True
+    if not FEISHU_OAUTH_AVAILABLE:
+        st.warning("飞书登录模块未就绪，请确认 feishu_oauth.py 存在。")
+        return True
+    app_id = os.getenv("FEISHU_APP_ID")
+    secret = os.getenv("FEISHU_APP_SECRET")
+    redirect = os.getenv("FEISHU_REDIRECT_URI")
+    if not app_id or not secret or not redirect:
+        st.warning("请配置 FEISHU_APP_ID、FEISHU_APP_SECRET、FEISHU_REDIRECT_URI 以启用飞书登录。")
+        return True
+    user = st.session_state.get("feishu_user")
+    if user:
+        return True
+    query = st.query_params
+    code = query.get("code")
+    if code:
+        try:
+            u = exchange_code_for_user(code)
+            if u:
+                st.session_state["feishu_user"] = u
+                st.query_params.clear()
+                st.rerun()
+        except Exception as e:
+            st.error(f"登录失败：{e}")
+            return False
+    auth_url = build_authorize_url(redirect, state="app203")
+    st.markdown("### 请先登录")
+    st.markdown("使用飞书账号登录后即可访问本看板。")
+    st.link_button("飞书登录", auth_url, type="primary")
+    return False
 
 
 def main():
@@ -5419,8 +5454,15 @@ def main():
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
 
-    # 侧边栏：数据源（团队共享 SQLite + 飞书表格 + 导入入口）
+    # 侧边栏：用户信息 + 数据源
     with st.sidebar:
+        if str(os.getenv("FEISHU_LOGIN_REQUIRED", "0")).strip() == "1" and st.session_state.get("feishu_user"):
+            u = st.session_state["feishu_user"]
+            name = u.get("name") or u.get("user_id") or u.get("open_id", "未知")
+            st.caption(f"👤 {name}")
+            if st.button("退出登录", key="logout"):
+                del st.session_state["feishu_user"]
+                st.rerun()
         st.header("数据源")
         source_options = ["数据库（团队共享）", "飞书多维表格", "上传文件（覆盖数据库）", "目录下全部 CSV（覆盖数据库）"]
         source = st.radio("数据来源", source_options, index=0)
@@ -5435,8 +5477,11 @@ def main():
             else:
                 bitable_url = st.text_input(
                     "飞书多维表格链接",
-                    value=os.getenv("FEISHU_BITABLE_URL", ""),
-                    placeholder="https://xxx.feishu.cn/base/AppToken 或含 ?table=TableId",
+                    value=os.getenv(
+                        "FEISHU_BITABLE_URL",
+                        "https://tkhome.feishu.cn/wiki/DFIYwb1ELigVNgkdJQAcoPArnRg?sheet=0zsvcA&table=tblodAIOVXskb6KM&view=vew6WTXj0C",
+                    ),
+                    placeholder="https://xxx.feishu.cn/base/AppToken 或 wiki 链接含 ?table=TableId",
                 )
                 if bitable_url.strip():
                     if st.button("🔄 从飞书加载", key="load_feishu"):
