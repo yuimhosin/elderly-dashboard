@@ -18,6 +18,13 @@ from data_loader import load_single_csv, load_from_directory, load_uploaded, get
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
 try:
+    from feishu_bitable_loader import load_from_bitable
+    FEISHU_BITABLE_AVAILABLE = True
+except ImportError:
+    FEISHU_BITABLE_AVAILABLE = False
+
+
+try:
     from openai import OpenAI
     DEEPSEEK_CLIENT_AVAILABLE = True
 except ImportError:
@@ -5397,22 +5404,65 @@ def _render_project_wizard(df: pd.DataFrame):
         st.rerun()
 
 
+def _require_feishu_login() -> bool:
+    """登录门禁（已关闭）。"""
+    return True
+
+
 def main():
+    if not _require_feishu_login():
+        return
+
     st.title("养老社区改良改造进度管理看板")
     st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
 
-    # 侧边栏：数据源（团队共享 SQLite + 导入入口）
+    # 侧边栏：数据源（团队共享 SQLite + 飞书表格 + 导入入口）
     with st.sidebar:
         st.header("数据源")
-        source = st.radio(
-            "数据来源",
-            ["数据库（团队共享）", "上传文件（覆盖数据库）", "目录下全部 CSV（覆盖数据库）"],
-            index=0,
-        )
+        source_options = ["数据库（团队共享）", "飞书多维表格", "上传文件（覆盖数据库）", "目录下全部 CSV（覆盖数据库）"]
+        source = st.radio("数据来源", source_options, index=0)
         df_db = load_from_db()
         df = pd.DataFrame()
 
-        if source == "数据库（团队共享）":
+        if source == "飞书多维表格":
+            if not FEISHU_BITABLE_AVAILABLE:
+                st.warning("未安装飞书加载模块，请确认 feishu_bitable_loader.py 存在。")
+            elif not os.getenv("FEISHU_APP_ID") or not os.getenv("FEISHU_APP_SECRET"):
+                st.warning("请配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET（Streamlit Secrets 或环境变量）。")
+            else:
+                bitable_url = st.text_input(
+                    "飞书多维表格链接",
+                    value=os.getenv("FEISHU_BITABLE_URL", ""),
+                    placeholder="https://xxx.feishu.cn/base/AppToken 或含 ?table=TableId",
+                )
+                if bitable_url.strip():
+                    if st.button("🔄 从飞书加载", key="load_feishu"):
+                        with st.spinner("正在从飞书加载..."):
+                            loaded = load_from_bitable(bitable_url.strip())
+                        if loaded.empty:
+                            st.warning("未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
+                        else:
+                            st.session_state["df_from_feishu"] = loaded
+                            st.success(f"已从飞书加载，共 {len(loaded)} 条记录。")
+                            st.rerun()
+                    if "df_from_feishu" in st.session_state:
+                        df = st.session_state["df_from_feishu"]
+                        st.caption(f"当前显示飞书数据，共 {len(df)} 条。可「导入到数据库」后切换为数据库进行编辑。")
+                        if st.button("✅ 导入到数据库（覆盖）", type="primary", key="feishu_to_db"):
+                            save_to_db(df)
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已从飞书多维表格导入，共 {len(df)} 条记录。"):
+                                    st.success("已导入到数据库并推送至飞书。")
+                                else:
+                                    st.success("已导入到数据库。"); st.warning("飞书推送失败。")
+                            else:
+                                st.success("已导入到数据库。")
+                            del st.session_state["df_from_feishu"]
+                            st.rerun()
+                else:
+                    st.info("请填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
+
+        elif source == "数据库（团队共享）":
             if df_db.empty:
                 # 优先内嵌 .enc（Streamlit Cloud）；其次 改良改造报表-V4.csv
                 default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
@@ -5548,8 +5598,14 @@ def main():
     # 自动添加城市和区域列（用于地图与导出）
     df = _add_城市和区域列(df)
 
-    tab1, tab2 = st.tabs(["全部项目（可在线编辑）", "新增/修改项目"])
+    tab1, tab2 = st.tabs(["新增/修改项目", "全部项目（可在线编辑）"])
     with tab1:
+        st.subheader("项目录入 / 修改向导")
+        st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
+        if _get_feishu_webhook_url():
+            st.info("💬 只要修改了数据并保存，飞书将自动收到消息推送。")
+        _render_project_wizard(df)
+    with tab2:
         st.subheader("全部项目清单（可在线编辑）")
         st.caption(f"共 {len(df)} 条项目。可在下表中直接增删改，点击下方按钮保存到数据库。")
         base_order = [
@@ -5580,12 +5636,6 @@ def main():
                     st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
             else:
                 st.success("已保存到 SQLite 数据库。其他用户刷新页面后将看到最新数据。")
-    with tab2:
-        st.subheader("项目录入 / 修改向导")
-        st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
-        if _get_feishu_webhook_url():
-            st.info("💬 只要修改了数据并保存，飞书将自动收到消息推送。")
-        _render_project_wizard(df)
 
 
 if __name__ == "__main__":
