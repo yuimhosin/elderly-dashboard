@@ -5212,13 +5212,15 @@ def _render_project_wizard(df: pd.DataFrame):
             备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
 
             st.markdown("**项目节点日期**（不更新则选「不更新」）")
-            选择节点 = st.selectbox("选择要更新的节点", options=["（不更新）"] + [c for c in TIMELINE_COLS if c in df_all.columns], key="edit_node_select")
+            timeline_opts = ["（不更新）"] + list(TIMELINE_COLS)
+            _seq = int(target_row.get("序号", 0))
+            选择节点 = st.selectbox("选择要更新的节点", options=timeline_opts, index=0, key=f"edit_node_{_seq}")
             edit_selected_date = None
-            if 选择节点 != "（不更新）":
+            if 选择节点 and 选择节点 != "（不更新）":
                 raw_val = target_row.get(选择节点, "")
                 existing_d = _str_to_date(raw_val)
                 default_d = existing_d if existing_d != SENTINEL_DATE else date(2026, 1, 1)
-                edit_selected_date = st.date_input(f"「{选择节点}」日期", value=default_d, min_value=DATE_RANGE_MIN, max_value=DATE_RANGE_MAX, format="YYYY-MM-DD", key="edit_date_picker")
+                edit_selected_date = st.date_input(f"「{选择节点}」日期", value=default_d, min_value=DATE_RANGE_MIN, max_value=DATE_RANGE_MAX, format="YYYY-MM-DD", key=f"edit_date_{_seq}")
 
             col_save, col_del = st.columns(2)
             with col_save:
@@ -5346,9 +5348,10 @@ def _render_project_wizard(df: pd.DataFrame):
         拟定金额 = st.number_input("拟定金额（万元）*", min_value=0.0, value=0.0, step=1.0)
 
         st.markdown("**项目节点日期**（不填写则选「不更新」）")
-        选择节点 = st.selectbox("选择要填写的节点", options=["（不更新）"] + list(TIMELINE_COLS), key="add_node_select")
+        timeline_opts = ["（不更新）"] + list(TIMELINE_COLS)
+        选择节点 = st.selectbox("选择要填写的节点", options=timeline_opts, index=0, key="add_node_select")
         add_selected_date = None
-        if 选择节点 != "（不更新）":
+        if 选择节点 and 选择节点 != "（不更新）":
             add_selected_date = st.date_input(f"「{选择节点}」日期", value=date(2026, 1, 1), min_value=DATE_RANGE_MIN, max_value=DATE_RANGE_MAX, format="YYYY-MM-DD", key="add_date_picker")
 
         submitted = st.form_submit_button("✅ 完成并写入数据库")
