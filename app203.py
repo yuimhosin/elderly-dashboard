@@ -55,10 +55,11 @@ st.set_page_config(
 
 # 默认数据目录与默认单文件路径
 # 这里将项目根目录下的 CSV 表作为默认文件，方便打包后的 exe 直接使用
-DEFAULT_DATA_DIR = str(Path(__file__).resolve().parent)
-DEFAULT_SINGLE_FILE = str(
-    Path(__file__).resolve().parent / "改良改造报表-V4.csv"
-)
+ROOT_DIR = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = str(ROOT_DIR)
+DEFAULT_SINGLE_FILE = str(ROOT_DIR / "改良改造报表-V4.csv")
+# 内嵌默认数据（加密 .enc，随 git 提交，Streamlit Cloud 部署用）
+DEFAULT_BUNDLED_CSV = ROOT_DIR / "改良改造报表-V4-sample.csv.enc"
 
 # 专业 9 大类（与 CSV 中「专业」列对应，用于分类统计）
 专业大类 = [
@@ -5283,20 +5284,20 @@ def main():
 
         if source == "数据库（团队共享）":
             if df_db.empty:
-                # 若默认 CSV（改良改造报表-V4.csv）存在，则用其初始化团队共享数据库
-                default_csv = Path(DEFAULT_SINGLE_FILE)
+                # 优先内嵌 .enc（Streamlit Cloud）；其次 改良改造报表-V4.csv
+                default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
                 if default_csv.exists():
                     try:
                         df = load_single_csv(str(default_csv))
                         if not df.empty:
                             save_to_db(df)
                             if _get_feishu_webhook_url():
-                                if push_to_feishu(f"【养老社区进度表】已用「改良改造报表-V4.csv」初始化，共 {len(df)} 条记录。"):
-                                    st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
+                                if push_to_feishu(f"【养老社区进度表】已用「{default_csv.name}」初始化，共 {len(df)} 条记录。"):
+                                    st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
                                 else:
-                                    st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                                    st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
                             else:
-                                st.success(f"已用「改良改造报表-V4.csv」初始化团队共享数据库，共 {len(df)} 条记录。")
+                                st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录。")
                         else:
                             st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
                     except Exception as e:
