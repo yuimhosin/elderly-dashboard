@@ -13,7 +13,7 @@ import os
 import sqlite3
 import json
 import urllib.request
-from datetime import datetime
+from datetime import datetime, date
 from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask, TIMELINE_COLS
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
@@ -83,6 +83,36 @@ def _get_dropdown_options(df: pd.DataFrame, col: str, extras: list = None) -> li
     if extras:
         opts = sorted(set(opts) | set(extras))
     return [x for x in opts if x and str(x).strip() != "nan"]
+
+
+DATE_RANGE_MIN = date(2020, 1, 1)
+DATE_RANGE_MAX = date(2030, 12, 31)
+SENTINEL_DATE = date(2000, 1, 1)  # 表示未填写
+
+
+def _str_to_date(s) -> date:
+    """字符串转 date，空或无效则返回 SENTINEL_DATE。"""
+    if not s or (isinstance(s, str) and not str(s).strip()):
+        return SENTINEL_DATE
+    try:
+        dt = pd.to_datetime(s, errors="coerce", format="mixed")
+        if pd.isna(dt):
+            return SENTINEL_DATE
+        d = dt.date() if hasattr(dt, "date") else dt
+        if not (DATE_RANGE_MIN <= d <= DATE_RANGE_MAX):
+            return SENTINEL_DATE
+        return d
+    except Exception:
+        return SENTINEL_DATE
+
+
+def _date_to_str(d) -> str:
+    """date 转 YYYY-MM-DD，SENTINEL_DATE 或 None 转为空。"""
+    if d is None or (hasattr(d, "year") and d.year == 2000 and d.month == 1 and d.day == 1):
+        return ""
+    if isinstance(d, date):
+        return d.strftime("%Y-%m-%d")
+    return str(d) if d else ""
 
 # ---------- 团队共享数据：SQLite 存储 ----------
 DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
@@ -5159,7 +5189,7 @@ def _render_project_wizard(df: pd.DataFrame):
                 _zv = str(target_row.get("总部重点关注项目", ""))
                 总部重点关注项目 = st.selectbox("总部重点关注项目（选填）", options=[""] + 总部_opts, index=总部_opts.index(_zv) + 1 if _zv in 总部_opts else 0)
             with c8:
-                拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
+                拟定金额 = st.number_input("拟定金额（万元）*", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
 
             st.markdown("**专业与名称**")
             c9, c10 = st.columns(2)
@@ -5174,14 +5204,14 @@ def _render_project_wizard(df: pd.DataFrame):
             项目名称 = st.text_input("项目名称（选填）", value=str(target_row.get("项目名称", "")))
             备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
 
-            st.markdown("**项目节点日期（全部选填）**")
-            date_values = {}
-            for col in TIMELINE_COLS:
-                if col not in df_all.columns:
-                    continue
-                raw_val = target_row.get(col, "")
-                date_str = "" if pd.isna(raw_val) else str(raw_val)
-                date_values[col] = st.text_input(f"{col}", value=date_str)
+            st.markdown("**项目节点日期**（不更新则选「不更新」）")
+            选择节点 = st.selectbox("选择要更新的节点", options=["（不更新）"] + [c for c in TIMELINE_COLS if c in df_all.columns], key="edit_node_select")
+            edit_selected_date = None
+            if 选择节点 != "（不更新）":
+                raw_val = target_row.get(选择节点, "")
+                existing_d = _str_to_date(raw_val)
+                default_d = existing_d if existing_d != SENTINEL_DATE else date(2026, 1, 1)
+                edit_selected_date = st.date_input(f"「{选择节点}」日期", value=default_d, min_value=DATE_RANGE_MIN, max_value=DATE_RANGE_MAX, format="YYYY-MM-DD", key="edit_date_picker")
 
             col_save, col_del = st.columns(2)
             with col_save:
@@ -5201,6 +5231,9 @@ def _render_project_wizard(df: pd.DataFrame):
             st.rerun()
 
         if submitted:
+            if float(拟定金额 or 0) <= 0:
+                st.error("拟定金额为必填项，需大于 0。")
+                return
             df_new = df_all.copy()
             mask = df_new["序号"].astype(int) == seq_val
             update_dict = {
@@ -5221,9 +5254,13 @@ def _render_project_wizard(df: pd.DataFrame):
             for col, val in update_dict.items():
                 if col in df_new.columns:
                     df_new.loc[mask, col] = val
-            for col, val in date_values.items():
-                if col in df_new.columns:
-                    df_new.loc[mask, col] = val
+            for col in TIMELINE_COLS:
+                if col not in df_new.columns:
+                    continue
+                if 选择节点 == col and edit_selected_date is not None:
+                    df_new.loc[mask, col] = _date_to_str(edit_selected_date)
+                else:
+                    df_new.loc[mask, col] = _date_to_str(_str_to_date(target_row.get(col, "")))
             save_to_db(df_new)
             if _get_feishu_webhook_url():
                 modified_row = df_new.loc[mask].iloc[0]
@@ -5253,7 +5290,7 @@ def _render_project_wizard(df: pd.DataFrame):
     st.markdown("### 新增项目")
     df_all = _ensure_project_columns(df_all)
     next_seq = _get_next_序号(df_all)
-    required_fields = ["园区", "所属业态", "项目分级", "项目分类", "拟定承建组织", "专业", "项目名称"]
+    required_fields = ["园区", "所属业态", "项目分级", "项目分类", "拟定承建组织", "专业", "项目名称", "拟定金额"]
 
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
@@ -5299,12 +5336,13 @@ def _render_project_wizard(df: pd.DataFrame):
 
         项目名称 = st.text_input("项目名称*")
         备注说明 = st.text_area("备注说明（选填）")
-        拟定金额 = st.number_input("拟定金额（万元，选填）", min_value=0.0, value=0.0, step=1.0)
+        拟定金额 = st.number_input("拟定金额（万元）*", min_value=0.0, value=0.0, step=1.0)
 
-        st.markdown("**项目节点日期（全部选填）**")
-        date_values = {}
-        for col in TIMELINE_COLS:
-            date_values[col] = st.text_input(f"{col}", value="", key=f"add_{col}")
+        st.markdown("**项目节点日期**（不填写则选「不更新」）")
+        选择节点 = st.selectbox("选择要填写的节点", options=["（不更新）"] + list(TIMELINE_COLS), key="add_node_select")
+        add_selected_date = None
+        if 选择节点 != "（不更新）":
+            add_selected_date = st.date_input(f"「{选择节点}」日期", value=date(2026, 1, 1), min_value=DATE_RANGE_MIN, max_value=DATE_RANGE_MAX, format="YYYY-MM-DD", key="add_date_picker")
 
         submitted = st.form_submit_button("✅ 完成并写入数据库")
 
@@ -5325,7 +5363,11 @@ def _render_project_wizard(df: pd.DataFrame):
             "备注说明": 备注说明,
             "拟定金额": 拟定金额,
         }
-        missing = [k for k in required_fields if not str(form_dict.get(k, "")).strip()]
+        missing = [k for k in required_fields if k != "拟定金额" and not str(form_dict.get(k, "")).strip()]
+        if "拟定金额" in required_fields:
+            amt = float(form_dict.get("拟定金额") or 0)
+            if amt <= 0:
+                missing.append("拟定金额（需大于 0）")
         if missing:
             st.error(f"以下字段为必填：{', '.join(missing)}")
             return
@@ -5337,8 +5379,11 @@ def _render_project_wizard(df: pd.DataFrame):
 
         token = str(uuid.uuid4())
         form_dict["上传凭证"] = token
-        for col, val in date_values.items():
-            form_dict[col] = val
+        for col in TIMELINE_COLS:
+            if col not in form_dict:
+                form_dict[col] = ""
+            if 选择节点 == col and add_selected_date is not None:
+                form_dict[col] = _date_to_str(add_selected_date)
 
         df_new_row = pd.DataFrame([form_dict])
         df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
