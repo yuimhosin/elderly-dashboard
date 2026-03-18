@@ -8,13 +8,12 @@ import pandas as pd
 from pathlib import Path
 import tempfile
 import io
-import base64
 import os
 import sqlite3
 import json
 import urllib.request
 from datetime import datetime, date
-from data_loader import load_single_csv, load_from_directory, load_uploaded, get_稳定需求_mask, TIMELINE_COLS
+from data_loader import load_single_csv, load_from_directory, load_uploaded, TIMELINE_COLS
 from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
 
 try:
@@ -34,20 +33,6 @@ try:
     DEEPSEEK_CLIENT_AVAILABLE = True
 except ImportError:
     DEEPSEEK_CLIENT_AVAILABLE = False
-
-# PDF导出相关导入
-try:
-    from reportlab.lib.pagesizes import A4, letter
-    from reportlab.lib import colors
-    from reportlab.lib.units import inch
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
 
 # 图表配色：饼图用 20+ 种不重复颜色，避免多分类时颜色重复
 CHART_COLORS_PIE = [
@@ -1971,164 +1956,6 @@ def _render_图表_简易(sub: pd.DataFrame):
     by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("拟定金额", "sum")).reset_index().sort_values("金额", ascending=False)
     if not by_prof_m.empty:
         st.bar_chart(by_prof_m.set_index("专业")["金额"])
-
-
-def generate_pdf_report_html(df: pd.DataFrame, 园区选择: list, output_path: str = None):
-    """生成PDF报告，使用HTML转PDF方式，完整保留网页所有内容"""
-    if output_path is None:
-        output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf').name
-    
-    # 处理园区选择
-    if 园区选择 and len(园区选择) > 0:
-        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
-        if valid_parks:
-            sub = df[df["园区"].isin(valid_parks)]
-        else:
-            sub = df[df["园区"].notna()]
-    else:
-        sub = df[df["园区"].notna()]
-    
-    # 过滤汇总行
-    if "序号" in sub.columns:
-        sub = sub[sub["序号"].notna()]
-        sub = sub[~sub["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
-        sub = sub[pd.to_numeric(sub["序号"], errors='coerce').notna()]
-    
-    # 添加城市和区域列
-    df_with_location = _add_城市和区域列(df)
-    if 园区选择 and len(园区选择) > 0:
-        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
-        if valid_parks:
-            sub_location = df_with_location[df_with_location["园区"].isin(valid_parks)]
-        else:
-            sub_location = df_with_location[df_with_location["园区"].notna()]
-    else:
-        sub_location = df_with_location[df_with_location["园区"].notna()]
-    
-    if "序号" in sub_location.columns:
-        sub_location = sub_location[sub_location["序号"].notna()]
-        sub_location = sub_location[~sub_location["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
-        sub_location = sub_location[pd.to_numeric(sub_location["序号"], errors='coerce').notna()]
-    
-    # 生成HTML内容
-    html_content = generate_html_report(df, sub, sub_location, 园区选择)
-    
-    # 尝试使用weasyprint转换为PDF
-    try:
-        from weasyprint import HTML, CSS
-        from weasyprint.text.fonts import FontConfiguration
-        
-        font_config = FontConfiguration()
-        HTML(string=html_content).write_pdf(
-            output_path,
-            stylesheets=[CSS(string='''
-                @page {
-                    size: A4;
-                    margin: 2cm;
-                }
-                body {
-                    font-family: "Microsoft YaHei", "SimSun", "SimHei", sans-serif;
-                    font-size: 12px;
-                    line-height: 1.6;
-                }
-                h1 { font-size: 24px; color: #1f4788; margin-top: 20px; margin-bottom: 15px; }
-                h2 { font-size: 20px; color: #2c5aa0; margin-top: 18px; margin-bottom: 12px; }
-                h3 { font-size: 16px; color: #4a7bc8; margin-top: 15px; margin-bottom: 10px; }
-                h4 { font-size: 14px; margin-top: 12px; margin-bottom: 8px; }
-                table { border-collapse: collapse; width: 100%; margin: 10px 0; }
-                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-                th { background-color: #4a7bc8; color: white; font-weight: bold; }
-                tr:nth-child(even) { background-color: #f2f2f2; }
-                .chart-container { margin: 20px 0; text-align: center; }
-                .section { page-break-inside: avoid; margin-bottom: 30px; }
-            ''')],
-            font_config=font_config
-        )
-        return output_path
-    except (ImportError, Exception) as e:
-        # 如果weasyprint不可用或失败，使用subprocess调用独立的playwright脚本
-        weasyprint_error = str(e)
-        try:
-            import subprocess
-            import os
-            import sys
-            
-            # 创建临时HTML文件
-            html_file = tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8')
-            html_file.write(html_content)
-            html_file.close()
-            html_path = html_file.name
-            
-            # 转换文件路径为file:// URL格式
-            html_abs_path = os.path.abspath(html_path)
-            file_url = f"file:///{html_abs_path.replace(os.sep, '/')}"
-            
-            # 创建独立的playwright脚本文件
-            script_content = f'''# -*- coding: utf-8 -*-
-import asyncio
-import sys
-from playwright.async_api import async_playwright
-
-async def main():
-    html_url = "{file_url}"
-    pdf_path = r"{output_path}"
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(html_url, wait_until="networkidle", timeout=30000)
-        await page.pdf(
-            path=pdf_path,
-            format="A4",
-            print_background=True,
-            margin={{"top": "2cm", "right": "2cm", "bottom": "2cm", "left": "2cm"}}
-        )
-        await browser.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-'''
-            
-            script_file = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
-            script_file.write(script_content)
-            script_file.close()
-            script_path = script_file.name
-            
-            # 使用subprocess运行脚本（在新进程中，避免asyncio冲突）
-            result = subprocess.run(
-                [sys.executable, script_path],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                cwd=os.path.dirname(script_path)
-            )
-            
-            # 清理临时文件
-            Path(script_path).unlink(missing_ok=True)
-            Path(html_path).unlink(missing_ok=True)
-            
-            if result.returncode != 0:
-                error_msg = result.stderr if result.stderr else result.stdout
-                raise Exception(f"Playwright脚本执行失败 (返回码: {result.returncode}): {error_msg}")
-            
-            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                raise Exception("PDF文件未生成或文件为空")
-            
-            return output_path
-        except ImportError as e2:
-            raise ImportError(f"PDF生成失败。weasyprint错误: {weasyprint_error}。playwright未安装，请运行: pip install playwright && playwright install chromium")
-        except subprocess.TimeoutExpired:
-            raise Exception(f"PDF生成超时。请检查playwright是否正确安装: playwright install chromium")
-        except Exception as e2:
-            # 删除临时文件（如果存在）
-            try:
-                if 'html_path' in locals():
-                    Path(html_path).unlink(missing_ok=True)
-                if 'script_path' in locals():
-                    Path(script_path).unlink(missing_ok=True)
-            except:
-                pass
-            raise Exception(f"PDF生成失败。weasyprint错误: {weasyprint_error}。playwright错误: {str(e2)}。请检查playwright是否正确安装: playwright install chromium")
 
 
 def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
@@ -4835,17 +4662,12 @@ def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
     return html_content
 
 
-def generate_html_report(df: pd.DataFrame, sub: pd.DataFrame, sub_location: pd.DataFrame, 园区选择: list) -> str:
-    """生成交互式HTML报告（新版本，完全交互式）"""
+def generate_html_report(df: pd.DataFrame, 园区选择: list) -> str:
+    """生成交互式HTML报告（完全交互式）。"""
     return generate_interactive_html(df, 园区选择)
 
 
 
-
-
-def generate_pdf_report(df: pd.DataFrame, 园区选择: list, output_path: str = None):
-    """生成PDF报告，包含所有页面内容（使用HTML转PDF方式）"""
-    return generate_pdf_report_html(df, 园区选择, output_path)
 
 
 def _get_deepseek_api_key(provided: str | None = None) -> str | None:
