@@ -5658,7 +5658,22 @@ def main():
         has_prof = "专业" in df.columns and df["专业"].astype(str).str.strip().str.len().gt(0).sum() > len(df) // 2
         has_name = "项目名称" in df.columns and df["项目名称"].astype(str).str.strip().str.len().gt(0).sum() > len(df) // 2
         if not has_prof or not has_name:
-            st.warning("当前数据中「专业」「项目名称」等列多为空，可能是旧库列对齐问题。请用侧边栏「上传文件（覆盖数据库）」重新上传 **改良改造报表-V4.csv** 并保存，即可修复显示。")
+            # 自愈：若当前数据来自团队共享数据库，且检测到旧库列对齐问题，则自动用默认内嵌数据覆盖修复
+            if source == "数据库（团队共享）" and not st.session_state.get("_db_auto_repair_done", False):
+                try:
+                    default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
+                    if default_csv.exists():
+                        df_new = load_single_csv(str(default_csv))
+                        if not df_new.empty:
+                            save_to_db(df_new)
+                            st.session_state["_db_auto_repair_done"] = True
+                            st.success(f"检测到旧库列对齐问题，已自动用「{default_csv.name}」重新初始化数据库（{len(df_new)} 条）。")
+                            st.rerun()
+                except Exception as e:
+                    st.session_state["_db_auto_repair_done"] = True
+                    st.warning(f"检测到旧库列对齐问题，但自动修复失败：{e}")
+
+            st.warning("当前数据中「专业」「项目名称」等列多为空，可能是旧库列对齐问题。已尝试自动修复；如仍异常，可删除/更换数据库文件或在侧边栏覆盖导入。")
 
     # 自动添加城市和区域列（用于地图与导出）
     df = _add_城市和区域列(df)
