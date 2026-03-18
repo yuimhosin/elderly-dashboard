@@ -128,6 +128,8 @@ def _date_to_str(d) -> str:
 
 # ---------- 团队共享数据：SQLite 存储 ----------
 DB_PATH = os.getenv("APP203_DB_PATH", "app203_projects.db")
+# 历史旧库行数：检测到则自动用默认数据覆盖替换
+LEGACY_DB_ROWS_TO_REPLACE = {337}
 
 
 def _get_db_connection():
@@ -5517,9 +5519,9 @@ def main():
                     st.info("请填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
 
         elif source == "数据库（团队共享）":
+            # 优先内嵌 .enc（Streamlit Cloud）；其次 改良改造报表-V4.csv
+            default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
             if df_db.empty:
-                # 优先内嵌 .enc（Streamlit Cloud）；其次 改良改造报表-V4.csv
-                default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
                 if default_csv.exists():
                     try:
                         df = load_single_csv(str(default_csv))
@@ -5540,6 +5542,15 @@ def main():
                 else:
                     st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
             else:
+                # 若数据库是历史旧数据（例如 337 行），直接用默认数据覆盖替换
+                if len(df_db) in LEGACY_DB_ROWS_TO_REPLACE and default_csv.exists():
+                    try:
+                        df_new = load_single_csv(str(default_csv))
+                        if not df_new.empty:
+                            save_to_db(df_new)
+                            df_db = df_new
+                    except Exception as e:
+                        st.warning(f"检测到历史旧数据但自动替换失败：{e}")
                 st.success(f"已从数据库加载，共 {len(df_db)} 条记录（所有用户共享）。")
                 df = df_db
 
