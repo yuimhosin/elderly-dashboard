@@ -71,13 +71,45 @@ def _get_current_time(timezone: str = "Asia/Shanghai") -> str:
 
 def _list_tables() -> str:
     """返回已配置的文档/表格清单（名称 + 链接），用于统一入口管理。"""
-    from feishu_doc_sync import get_doc_list_with_urls
-    items = get_doc_list_with_urls()
+    items = []
+    import_error = None
+    try:
+        from feishu_doc_sync import get_doc_list_with_urls
+        items = get_doc_list_with_urls()
+    except Exception as e:
+        # Streamlit Cloud 可能因依赖/文件裁剪导致导入失败，降级到 config 清单，避免应用整体报错
+        import_error = e
+        try:
+            from config import FEISHU_DOC_IDS, FEISHU_DOC_URLS
+            fallback_items = []
+            for i, item in enumerate(FEISHU_DOC_IDS):
+                if not item or len(item) != 2:
+                    continue
+                source, doc_id = item
+                if source == "bitable":
+                    app_token, table_id = doc_id if isinstance(doc_id, tuple) else ("", "")
+                    name_part = (table_id or app_token or "未命名")[:12]
+                    title = f"多维表格_{name_part}"
+                elif source == "wiki":
+                    title = "知识库"
+                else:
+                    title = "文档"
+                url = FEISHU_DOC_URLS[i] if i < len(FEISHU_DOC_URLS) else ""
+                fallback_items.append((title, url))
+            items = fallback_items
+        except Exception:
+            items = []
+
     if not items:
+        if import_error is not None:
+            return (
+                f"表格清单功能暂不可用（导入 feishu_doc_sync 失败：{import_error.__class__.__name__}）。\n"
+                "请检查部署中是否包含 feishu_doc_sync.py 及其依赖，或先在 Secrets 中配置 FEISHU_DOC_IDS。"
+            )
         return "当前未配置任何文档或表格。请在 FEISHU_DOC_IDS 中添加飞书文档/多维表格链接。"
     lines = []
     for i, (title, url) in enumerate(items, 1):
-        lines.append(f"{i}. **{title}**\n   {url}")
+        lines.append(f"{i}. **{title}**\n   {url or '（未提供链接）'}")
     return "\n\n".join(lines)
 
 
