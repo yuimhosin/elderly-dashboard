@@ -5308,7 +5308,6 @@ def _render_project_wizard(df: pd.DataFrame):
 
     with st.form("add_project_form"):
         st.caption(f"新项目序号将自动设置为：{next_seq}")
-        st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次录入的内容（含字段信息）将推送到飞书。")
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -5653,14 +5652,23 @@ def main():
     # 自动添加城市和区域列（用于地图与导出）
     df = _add_城市和区域列(df)
 
-    tab1, tab2 = st.tabs(["新增/修改项目", "全部项目（可在线编辑）"])
-    with tab1:
+    tab_dashboard, tab_map, tab_wizard, tab_editor = st.tabs(
+        ["项目统计看板", "地图与区域分析", "新增/修改项目", "全部项目（可在线编辑）"]
+    )
+
+    with tab_dashboard:
+        render_项目统计分析(df, 园区选择)
+
+    with tab_map:
+        render_地图与统计(df, 园区选择)
+
+    with tab_wizard:
         st.subheader("项目录入 / 修改向导")
         st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
         if _get_feishu_webhook_url():
             st.info("💬 只要修改了数据并保存，飞书将自动收到消息推送。")
         _render_project_wizard(df)
-    with tab2:
+    with tab_editor:
         st.subheader("全部项目清单（可在线编辑）")
         st.caption(f"共 {len(df)} 条项目。可在下表中直接增删改，点击下方按钮保存到数据库。")
         base_order = [
@@ -5679,18 +5687,31 @@ def main():
             hide_index=True,
             key="projects_editor",
         )
-        if st.button("💾 保存所有更改到数据库（团队共享）", type="primary", key="save_editor"):
-            old_df = load_from_db()
-            diff = _compute_df_diff(old_df, edited_df)
-            save_to_db(edited_df)
-            if _get_feishu_webhook_url():
-                payload = _build_feishu_payload_from_diff(diff, len(edited_df), source="看板编辑")
-                if push_to_feishu(payload=payload):
-                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+        col_save, col_export = st.columns([1, 1])
+        with col_save:
+            if st.button("💾 保存所有更改到数据库（团队共享）", type="primary", key="save_editor"):
+                old_df = load_from_db()
+                diff = _compute_df_diff(old_df, edited_df)
+                save_to_db(edited_df)
+                if _get_feishu_webhook_url():
+                    payload = _build_feishu_payload_from_diff(diff, len(edited_df), source="看板编辑")
+                    if push_to_feishu(payload=payload):
+                        st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                    else:
+                        st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
                 else:
-                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
-            else:
-                st.success("已保存到 SQLite 数据库。其他用户刷新页面后将看到最新数据。")
+                    st.success("已保存到 SQLite 数据库。其他用户刷新页面后将看到最新数据。")
+        with col_export:
+            buf = io.BytesIO()
+            edited_df.to_excel(buf, index=False, engine="openpyxl")
+            buf.seek(0)
+            st.download_button(
+                "📥 导出 Excel (.xlsx)",
+                data=buf,
+                file_name=f"改良改造进度表_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="export_xlsx",
+            )
 
 
 if __name__ == "__main__":
