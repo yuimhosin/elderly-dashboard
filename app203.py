@@ -840,8 +840,18 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
     # 按专业分包统计（如果存在该列且在标签池中勾选“专业分包”）
     if show_prof_subcontract and ("专业分包" in sub.columns or "专业细分" in sub.columns):
         prof_subcontract_col = "专业分包" if "专业分包" in sub.columns else "专业细分"
-        st.markdown("### 📦 按专业分包统计")
-        by_prof_subcontract = sub.groupby(prof_subcontract_col, dropna=False).agg(
+        # 若专业分包/细分几乎全为空，则自动回退到「专业」统计，避免全部落在空分类
+        effective_col = prof_subcontract_col
+        try:
+            nonempty = sub[prof_subcontract_col].astype(str).str.strip().ne("").sum()
+        except Exception:
+            nonempty = 0
+        if nonempty == 0 and "专业" in sub.columns:
+            effective_col = "专业"
+            st.info("当前数据的「专业分包/专业细分」为空，已自动改用「专业」进行统计。")
+
+        st.markdown("### 📦 按专业分包统计" if effective_col == prof_subcontract_col else "### 📦 按专业统计（替代专业分包）")
+        by_prof_subcontract = sub.groupby(effective_col, dropna=False).agg(
             项目数=("序号", "count"),
             金额合计=("拟定金额", "sum"),
         ).reset_index().sort_values("金额合计", ascending=False)
@@ -851,11 +861,11 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
         
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown("#### 专业分包项目数统计")
-            st.dataframe(by_prof_subcontract[["专业分包" if prof_subcontract_col == "专业分包" else "专业细分", "项目数", "项目数占比"]], use_container_width=True, hide_index=True)
+            st.markdown("#### 专业分包项目数统计" if effective_col == prof_subcontract_col else "#### 专业项目数统计")
+            st.dataframe(by_prof_subcontract[[effective_col, "项目数", "项目数占比"]], use_container_width=True, hide_index=True)
         with col2:
-            st.markdown("#### 专业分包金额统计")
-            st.dataframe(by_prof_subcontract[["专业分包" if prof_subcontract_col == "专业分包" else "专业细分", "金额合计", "金额占比"]], use_container_width=True, hide_index=True)
+            st.markdown("#### 专业分包金额统计" if effective_col == prof_subcontract_col else "#### 专业金额统计")
+            st.dataframe(by_prof_subcontract[[effective_col, "金额合计", "金额占比"]], use_container_width=True, hide_index=True)
         
         # 显示图表
         try:
@@ -865,8 +875,8 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
                 fig = px.pie(
                     by_prof_subcontract, 
                     values="项目数", 
-                    names=prof_subcontract_col,
-                    title="专业分包项目数占比",
+                    names=effective_col,
+                    title="专业分包项目数占比" if effective_col == prof_subcontract_col else "专业项目数占比",
                     color_discrete_sequence=CHART_COLORS_PIE[:len(by_prof_subcontract)]
                 )
                 fig.update_traces(textposition="outside", textinfo="label+percent+value")
@@ -875,23 +885,24 @@ def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
                 fig = px.pie(
                     by_prof_subcontract, 
                     values="金额合计", 
-                    names=prof_subcontract_col,
-                    title="专业分包金额占比",
+                    names=effective_col,
+                    title="专业分包金额占比" if effective_col == prof_subcontract_col else "专业金额占比",
                     color_discrete_sequence=CHART_COLORS_PIE[:len(by_prof_subcontract)]
                 )
                 fig.update_traces(textposition="outside", textinfo="label+percent+value")
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             
-            # 专业与专业分包的交叉统计
-            st.markdown("#### 专业与专业分包交叉统计")
-            cross_stats = sub.groupby(["专业", prof_subcontract_col], dropna=False).agg(
-                项目数=("序号", "count"),
-                金额合计=("拟定金额", "sum"),
-            ).reset_index().sort_values("金额合计", ascending=False)
-            # 过滤掉"其它系统"分类
-            cross_stats = cross_stats[~cross_stats["专业"].isin(["其它系统", "其他系统"])]
-            cross_stats["金额合计"] = cross_stats["金额合计"].round(2)
-            st.dataframe(cross_stats, use_container_width=True, hide_index=True)
+            # 专业与专业分包的交叉统计（仅当确实存在可用的专业分包/细分时展示）
+            if effective_col == prof_subcontract_col and "专业" in sub.columns:
+                st.markdown("#### 专业与专业分包交叉统计")
+                cross_stats = sub.groupby(["专业", prof_subcontract_col], dropna=False).agg(
+                    项目数=("序号", "count"),
+                    金额合计=("拟定金额", "sum"),
+                ).reset_index().sort_values("金额合计", ascending=False)
+                # 过滤掉"其它系统"分类
+                cross_stats = cross_stats[~cross_stats["专业"].isin(["其它系统", "其他系统"])]
+                cross_stats["金额合计"] = cross_stats["金额合计"].round(2)
+                st.dataframe(cross_stats, use_container_width=True, hide_index=True)
         except ImportError:
             pass
     
