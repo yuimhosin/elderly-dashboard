@@ -1,0 +1,57 @@
+# 环境与密钥
+.env
+.streamlit/secrets.toml
+feishu-rag/.streamlit/secrets.toml
+*.env
+!env_example.txt
+!*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+.venv/
+venv/
+ENV/
+
+# 构建与分发
+build/
+dist/
+*.spec
+*.egg-info/
+*.egg
+
+# 数据库与本地数据（可选：若需提交可移除）
+*.db
+*.sqlite
+*.sqlite3
+
+# 显式上传的报表（不随 git 提交）
+改良改造报表-V4.csv
+改良改造报表-示例.csv
+# 默认数据明文（加密版 .enc 随 git 提交）
+改良改造报表-V4-sample.csv
+
+# 飞书 RAG 向量库（含同步的文档内容，勿提交）
+feishu-rag/vector_db/
+
+# 临时与备份
+*.backup
+*.bak
+*.log
+*.tmp
+Untitled
+
+# 压缩包与二进制
+*.zip
+*.rar
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

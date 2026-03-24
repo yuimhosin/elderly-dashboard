@@ -1,0 +1,6227 @@
+# -*- coding: utf-8 -*-
+"""
+养老社区改良改造进度管理 - Streamlit 交互看板
+审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部运行保障协调招采/施工 → 总部督促验收
+"""
+import streamlit as st
+import pandas as pd
+from pathlib import Path
+import tempfile
+import io
+import os
+import json
+import html as html_module
+import urllib.request
+from datetime import datetime, date
+from functools import lru_cache
+from urllib.parse import quote_plus
+from data_loader import load_single_csv, load_from_directory, load_uploaded, TIMELINE_COLS
+from location_config import 园区_TO_城市, 园区_TO_区域, 城市_COORDS
+
+try:
+    from feishu_bitable_loader import load_from_bitable
+    FEISHU_BITABLE_AVAILABLE = True
+except ImportError:
+    FEISHU_BITABLE_AVAILABLE = False
+
+try:
+    from feishu_oauth import build_authorize_url, exchange_code_for_user
+    FEISHU_OAUTH_AVAILABLE = True
+except ImportError:
+    FEISHU_OAUTH_AVAILABLE = False
+
+try:
+    from openai import OpenAI
+    DEEPSEEK_CLIENT_AVAILABLE = True
+except ImportError:
+    DEEPSEEK_CLIENT_AVAILABLE = False
+
+# 图表配色：饼图用 20+ 种不重复颜色，避免多分类时颜色重复
+CHART_COLORS_PIE = [
+    "#5470c6", "#91cc75", "#fac858", "#ee6666", "#73c0de",
+    "#3ba272", "#fc8452", "#9a60b4", "#ea7ccc", "#5ad8a6",
+    "#6dc8ec", "#945fb9", "#ff9845", "#1e9bb5", "#ffbf00",
+    "#c23531", "#2f4554", "#61a0a8", "#d48265", "#749f83",
+    "#ca8622", "#bda29a", "#6e7074", "#546570", "#c4ccd3",
+]
+
+st.set_page_config(
+    page_title="养老社区改良改造进度管理",
+    page_icon="🏠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# 默认数据目录与默认单文件路径
+# 这里将项目根目录下的 CSV 表作为默认文件，方便打包后的 exe 直接使用
+ROOT_DIR = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = str(ROOT_DIR)
+DEFAULT_SINGLE_FILE = str(ROOT_DIR / "改良改造报表-V4.csv")
+# 内嵌默认数据（加密 .enc，随 git 提交，Streamlit Cloud 部署用）
+DEFAULT_BUNDLED_CSV = ROOT_DIR / "改良改造报表-V4-sample.csv.enc"
+
+
+def _load_local_dotenv() -> None:
+    """本地开发：若存在项目根目录 .env，则加载（不覆盖已有环境变量）。"""
+    try:
+        from dotenv import load_dotenv
+
+        p = ROOT_DIR / ".env"
+        if p.exists():
+            load_dotenv(p, override=False)
+    except ImportError:
+        pass
+
+
+_load_local_dotenv()
+
+_DB_SECRETS_IN_ENV = False
+
+
+def _ensure_db_secrets_in_env() -> None:
+    """将 Streamlit secrets 中的数据库相关键写入 os.environ，供 SQLAlchemy 读取。"""
+    global _DB_SECRETS_IN_ENV
+    if _DB_SECRETS_IN_ENV:
+        return
+    _DB_SECRETS_IN_ENV = True
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            for key in (
+                "APP203_DATABASE_URL",
+                "MYSQL_HOST",
+                "MYSQL_PORT",
+                "MYSQL_USER",
+                "MYSQL_PASSWORD",
+                "MYSQL_DATABASE",
+                "MYSQL_DB",
+                "APP203_DB_PATH",
+            ):
+                if str(os.environ.get(key, "")).strip():
+                    continue
+                try:
+                    if key in st.secrets:
+                        os.environ[key] = str(st.secrets[key])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+# 专业 9 大类（与 CSV 中「专业」列对应，用于分类统计）
+专业大类 = [
+    "土建设施", "供配电系统", "暖通/供冷系统", "弱电系统", "供排水系统",
+    "电梯系统", "其它系统", "消防系统", "安防系统"
+]
+
+# 下拉选项预设（用于新增/修改向导）
+OPT_所属业态 = ["独立", "护理", "其他"]
+OPT_项目分级 = ["一级（最高级）", "二级", "三级"]
+OPT_项目分类 = ["品质提升", "大修", "安全", "运营需求", "节能改造", "智能化提升", "金额10万以上的常规维修", "金额10万以上的房态更新", "其他改造"]
+OPT_拟定承建组织 = ["不动产项目部", "社区分包", "社区负责"]
+OPT_总部重点关注 = ["是", "否"]
+
+
+def _get_dropdown_options(df: pd.DataFrame, col: str, extras: list = None) -> list:
+    """从数据中提取唯一值 + 额外选项，用于下拉。"""
+    opts = []
+    if col in df.columns:
+        opts = sorted(df[col].dropna().astype(str).unique().tolist())
+    if extras:
+        opts = sorted(set(opts) | set(extras))
+    return [x for x in opts if x and str(x).strip() != "nan"]
+
+
+DATE_RANGE_MIN = date(2020, 1, 1)
+DATE_RANGE_MAX = date(2030, 12, 31)
+SENTINEL_DATE = date(2000, 1, 1)  # 表示未填写
+
+
+def _str_to_date(s) -> date:
+    """字符串转 date，空或无效则返回 SENTINEL_DATE。"""
+    if not s or (isinstance(s, str) and not str(s).strip()):
+        return SENTINEL_DATE
+    try:
+        dt = pd.to_datetime(s, errors="coerce", format="mixed")
+        if pd.isna(dt):
+            return SENTINEL_DATE
+        d = dt.date() if hasattr(dt, "date") else dt
+        if not (DATE_RANGE_MIN <= d <= DATE_RANGE_MAX):
+            return SENTINEL_DATE
+        return d
+    except Exception:
+        return SENTINEL_DATE
+
+
+def _date_to_str(d) -> str:
+    """date 转 YYYY-MM-DD，SENTINEL_DATE 或 None 转为空。"""
+    if d is None or (hasattr(d, "year") and d.year == 2000 and d.month == 1 and d.day == 1):
+        return ""
+    if isinstance(d, date):
+        return d.strftime("%Y-%m-%d")
+    return str(d) if d else ""
+
+# ---------- 团队共享数据：默认 SQLite，可与 project-wizard-feishu-github 共用 MySQL ----------
+# 优先级：APP203_DATABASE_URL > MYSQL_* 组合 > 本地 SQLite（APP203_DB_PATH）
+# 历史旧库行数：检测到则自动用默认数据覆盖替换
+LEGACY_DB_ROWS_TO_REPLACE = {337}
+
+
+def _sqlite_url_from_path(p: str) -> str:
+    fp = Path(p).expanduser().resolve()
+    # SQLAlchemy sqlite URL: sqlite:////absolute/path (Windows 也可用正斜杠)
+    return "sqlite:///" + fp.as_posix()
+
+
+def _resolve_database_url() -> str:
+    """解析数据库连接串：完整 URL 优先，其次 MYSQL_*，最后 SQLite。"""
+    _ensure_db_secrets_in_env()
+    explicit = os.getenv("APP203_DATABASE_URL", "").strip()
+    if explicit:
+        return explicit
+    host = os.getenv("MYSQL_HOST", "").strip()
+    if host:
+        user = os.getenv("MYSQL_USER", "").strip()
+        password = os.getenv("MYSQL_PASSWORD", "")
+        port = (os.getenv("MYSQL_PORT", "3306") or "3306").strip()
+        database = os.getenv("MYSQL_DATABASE", "").strip() or os.getenv("MYSQL_DB", "").strip()
+        if user and database:
+            safe_pw = quote_plus(password)
+            safe_user = quote_plus(user)
+            return f"mysql+pymysql://{safe_user}:{safe_pw}@{host}:{port}/{database}?charset=utf8mb4"
+    db_path = os.getenv("APP203_DB_PATH", "app203_projects.db")
+    return _sqlite_url_from_path(db_path)
+
+
+@lru_cache(maxsize=1)
+def _get_db_engine():
+    from sqlalchemy import create_engine
+
+    url = _resolve_database_url()
+    # pool_pre_ping: 避免长连接断开导致的报错
+    return create_engine(url, pool_pre_ping=True, future=True)
+
+
+def load_from_db() -> pd.DataFrame:
+    """加载团队共享数据表 projects。异常或表不存在则返回空表。"""
+    try:
+        engine = _get_db_engine()
+        with engine.connect() as conn:
+            return pd.read_sql("SELECT * FROM projects", conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+def save_to_db(df: pd.DataFrame):
+    """将当前 DataFrame 全量写入数据库（覆盖 projects 表）。"""
+    if df is None or df.empty:
+        return
+    engine = _get_db_engine()
+    # 用事务保证 replace 的一致性
+    with engine.begin() as conn:
+        df.to_sql("projects", conn, if_exists="replace", index=False)
+
+
+def _ensure_project_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """保证关键列存在，便于新增/修改向导统一写入。"""
+    needed = [
+        "序号", "园区", "所属区域", "城市", "所属业态",
+        "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
+        "专业", "专业分包", "项目名称", "备注说明", "拟定金额", "上传凭证",
+    ]
+    out = df.copy()
+    for col in needed:
+        if col not in out.columns:
+            out[col] = "" if col not in ["序号", "拟定金额"] else 0
+    return out
+
+
+def _strip_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """去掉列名为空字符串的列，避免 data_editor 因重复空列名报错。"""
+    keep_cols = [c for c in df.columns if str(c).strip() != ""]
+    return df[keep_cols].copy()
+
+
+def _canonicalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    加载后统一规范化：只保留分析所需列、合并城市列、固定列顺序，避免多列/错位导致后面列显示为空。
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out = _strip_empty_columns(out)
+    if "社区" in out.columns and "园区" not in out.columns:
+        out = out.rename(columns={"社区": "园区"})
+    elif "社区" in out.columns and "园区" in out.columns:
+        out["园区"] = out["园区"].fillna(out["社区"])
+        out = out.drop(columns=["社区"], errors="ignore")
+    if "所在城市" in out.columns:
+        if "城市" not in out.columns:
+            out["城市"] = out["所在城市"]
+        else:
+            out["城市"] = out["城市"].fillna(out["所在城市"])
+        out = out.drop(columns=["所在城市"], errors="ignore")
+    if "专业细分" in out.columns and "专业分包" not in out.columns:
+        out["专业分包"] = out["专业细分"]
+    if "专业细分" in out.columns and "专业分包" in out.columns:
+        out["专业分包"] = out["专业分包"].fillna(out["专业细分"])
+    if "专业细分" in out.columns:
+        out = out.drop(columns=["专业细分"], errors="ignore")
+    if "拟定金额" in out.columns:
+        out["拟定金额"] = pd.to_numeric(out["拟定金额"], errors="coerce").fillna(0)
+    if "序号" in out.columns:
+        out["序号"] = pd.to_numeric(out["序号"], errors="coerce")
+    base_order = [
+        "序号", "园区", "所属区域", "城市", "所属业态",
+        "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
+        "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+    ]
+    timeline_cols = [c for c in TIMELINE_COLS if c in out.columns]
+    extra = ["上传凭证"] if "上传凭证" in out.columns else []
+    want = base_order + timeline_cols + extra
+    existing = list(out.columns)
+    ordered = [c for c in want if c in existing]
+    rest = [c for c in existing if c not in ordered]
+    out = out[ordered + rest].copy()
+    return out
+
+
+def _get_next_序号(df: pd.DataFrame) -> int:
+    """根据现有数据自动生成下一个序号。"""
+    if "序号" not in df.columns or df.empty:
+        return 1
+    try:
+        nums = pd.to_numeric(df["序号"], errors="coerce")
+        m = nums.max()
+        return int(m) + 1 if pd.notna(m) else 1
+    except Exception:
+        return 1
+
+
+# ---------- 飞书推送（自定义机器人 Webhook）----------
+def _get_feishu_webhook_url() -> str | None:
+    """获取飞书 Webhook URL：Streamlit Secrets > 环境变量 FEISHU_WEBHOOK_URL。"""
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            for key in ("FEISHU_WEBHOOK_URL", "feishu_webhook_url"):
+                try:
+                    v = st.secrets[key]
+                    if v and str(v).strip().startswith("https://"):
+                        return str(v).strip()
+                except (KeyError, AttributeError, TypeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return os.getenv("FEISHU_WEBHOOK_URL") or None
+
+
+def _to_json_value(v):
+    """转为可 JSON 序列化的值（避免 numpy/NaN 导致请求体格式无效）。"""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    try:
+        if hasattr(v, "item"):  # numpy 标量
+            v = v.item()
+    except Exception:
+        return str(v)
+    if isinstance(v, float):
+        if v != v or v == float("inf") or v == float("-inf"):
+            return None
+        return int(v) if v == int(v) else v
+    if isinstance(v, (int, str, bool)):
+        return v
+    return str(v)
+
+
+def _row_to_dict(row: pd.Series) -> dict:
+    """将一行转为可 JSON 序列化的字典（键为字符串，值为原生类型）。"""
+    out = {}
+    for k, v in row.items():
+        out[str(k)] = _to_json_value(v)
+    return out
+
+
+def _format_cell(v) -> str:
+    """用于变更详情展示：None/NaN 显示为空字符串。"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return str(v).strip()
+
+
+def _compute_df_diff(old_df: pd.DataFrame, new_df: pd.DataFrame) -> dict:
+    """
+    按「序号」对比新旧表，返回删除、新增、修改的明细及修改详情（字段级 旧值→新值）。
+    返回：{"deleted": [], "added": [], "modified": [], "modified_details": [{序号, 变更项: ["列名: 旧→新"]}]}
+    """
+    out = {"deleted": [], "added": [], "modified": [], "modified_details": []}
+    if old_df.empty and new_df.empty:
+        return out
+    key_col = "序号"
+    if key_col not in old_df.columns or key_col not in new_df.columns:
+        return out
+    try:
+        old_df = old_df.dropna(subset=[key_col])
+        new_df = new_df.dropna(subset=[key_col])
+        old_df = old_df.astype({key_col: "float64"})
+        new_df = new_df.astype({key_col: "float64"})
+    except Exception:
+        return out
+    old_ids = set(old_df[key_col].astype(int).tolist())
+    new_ids = set(new_df[key_col].astype(int).tolist())
+    deleted_ids = old_ids - new_ids
+    added_ids = new_ids - old_ids
+    common_ids = old_ids & new_ids
+    for sid in deleted_ids:
+        row = old_df[old_df[key_col].astype(int) == sid].iloc[0]
+        out["deleted"].append(_row_to_dict(row))
+    for sid in added_ids:
+        row = new_df[new_df[key_col].astype(int) == sid].iloc[0]
+        out["added"].append(_row_to_dict(row))
+    for sid in common_ids:
+        old_row = old_df[old_df[key_col].astype(int) == sid].iloc[0]
+        new_row = new_df[new_df[key_col].astype(int) == sid].iloc[0]
+        if not old_row.equals(new_row):
+            out["modified"].append(_row_to_dict(new_row))
+            # 计算本条修改的字段级详情：列名 旧值→新值
+            changes = []
+            for col in old_row.index:
+                if col not in new_row.index:
+                    continue
+                ov = _format_cell(old_row[col])
+                nv = _format_cell(new_row[col])
+                if ov != nv:
+                    changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
+            out["modified_details"].append({"序号": int(sid), "变更项": changes})
+    return out
+
+
+def _build_feishu_payload_from_diff(diff: dict, total_after: int, source: str = "看板编辑") -> dict:
+    """根据 diff 构建飞书 Webhook 的 JSON 负载（含变更类型、修改内容及修改详情），全部为可序列化类型。"""
+    n_del = int(len(diff["deleted"]))
+    n_add = int(len(diff["added"]))
+    n_mod = int(len(diff["modified"]))
+    modified_details = diff.get("modified_details") or []
+    total_after = int(total_after)
+    parts = []
+    if n_del:
+        parts.append(f"删除 {n_del} 条")
+    if n_mod:
+        parts.append(f"修改 {n_mod} 条")
+    if n_add:
+        parts.append(f"新增 {n_add} 条")
+    summary_text = "、".join(parts) if parts else "无结构变更"
+    text = f"【养老社区进度表】{source}：{summary_text}，当前共 {total_after} 条记录。"
+    # 追加修改详情：每条记录的字段级变更（如 总部重点关注项目：是 → 否）
+    if modified_details:
+        detail_lines = []
+        for item in modified_details:
+            seq = item.get("序号", "")
+            changes = item.get("变更项") or []
+            if changes:
+                detail_lines.append(f"序号 {seq}：" + "；".join(changes))
+        if detail_lines:
+            text += "\n修改详情：\n" + "\n".join(detail_lines)
+    change_type = "mixed" if (n_del and n_add) or (n_del and n_mod) or (n_add and n_mod) else ("delete" if n_del and not n_add and not n_mod else ("add" if n_add and not n_del and not n_mod else "modify"))
+    # 飞书流程要求：大括号 {}、message_type 为文本类型、键值对（键字符串，值可字符串/数字/布尔/数组/对象/null）
+    payload = {
+        "message_type": "text",
+        "text": text,
+        "change_type": change_type,
+        "deleted_count": n_del,
+        "added_count": n_add,
+        "modified_count": n_mod,
+        "total_after": total_after,
+        "changes": {
+            "deleted": diff["deleted"],
+            "added": diff["added"],
+            "modified": diff["modified"],
+        },
+    }
+    if modified_details:
+        payload["modified_details"] = modified_details
+    return payload
+
+
+def _ensure_native_json(obj):
+    """递归将 dict/list 中的值转为可 JSON 序列化的原生类型，避免请求体格式无效。"""
+    if obj is None or isinstance(obj, (bool, str)):
+        return obj
+    if isinstance(obj, (int, float)):
+        if isinstance(obj, float) and (obj != obj or abs(obj) == float("inf")):
+            return None
+        return int(obj) if isinstance(obj, float) and obj == int(obj) else obj
+    if hasattr(obj, "item"):
+        try:
+            return _ensure_native_json(obj.item())
+        except Exception:
+            return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _ensure_native_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_ensure_native_json(x) for x in obj]
+    return str(obj)
+
+
+def push_to_feishu(text: str | None = None, payload: dict | None = None) -> bool:
+    """向飞书 Webhook 推送。payload 会先做原生类型清理再发送，避免请求体格式无效。"""
+    url = _get_feishu_webhook_url()
+    if not url:
+        return False
+    if payload is not None:
+        body_dict = _ensure_native_json(payload)
+        # 飞书流程要求 message_type + 键值对；若设 FEISHU_PAYLOAD_SIMPLE=1 则只发扁平键值对，changes 转为 changes_json 字符串
+        if os.getenv("FEISHU_PAYLOAD_SIMPLE", "").strip() in ("1", "true", "True"):
+            _modified_details = body_dict.get("modified_details")
+            body_dict = {
+                "message_type": "text",
+                "text": body_dict.get("text") or "",
+                "change_type": body_dict.get("change_type", ""),
+                "deleted_count": body_dict.get("deleted_count", 0),
+                "added_count": body_dict.get("added_count", 0),
+                "modified_count": body_dict.get("modified_count", 0),
+                "total_after": body_dict.get("total_after", 0),
+                "changes_json": json.dumps(body_dict.get("changes") or {}, ensure_ascii=False, default=str),
+            }
+            if _modified_details:
+                body_dict["modified_details"] = _modified_details
+        elif body_dict.get("message_type") is None and body_dict.get("msg_type") is not None:
+            body_dict["message_type"] = "text"
+    elif text and str(text).strip():
+        body_dict = {"message_type": "text", "text": text.strip()}
+    else:
+        return False
+    # 调试：在终端打印本次推送的 text，便于确认是否含修改详情（若仍只看到旧文案，请检查飞书流程是否引用 text 参数）
+    _msg = body_dict.get("text") or ""
+    if _msg and os.getenv("FEISHU_DEBUG_TEXT"):
+        print("[飞书推送] text:", _msg[:200] + ("..." if len(_msg) > 200 else ""))
+    try:
+        body = json.dumps(body_dict, ensure_ascii=False, default=str).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json; charset=utf-8"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode())
+                return data.get("StatusCode") == 0 or data.get("code") == 0
+    except Exception:
+        pass
+    return False
+
+
+def render_审核流程说明():
+    """审核流程说明区块。"""
+    st.markdown("### 📋 需求审核与实施流程说明")
+    steps = [
+        ("1. 社区提出", "一线园区提出改造需求。"),
+        ("2. 紧急程度分级", "按一级（最高级）、二级、三级划分。"),
+        ("3. 专业分类", "按 9 大类专业划分：土建、供配电、暖通/供冷、弱电、供排水、电梯、其它、消防、安防等。"),
+        ("4. 财务预算拆分", "按预算系统进行金额拆分与汇总。"),
+        ("5. 一线立项时间", "一线填写需求并提出立项时间。"),
+        ("6. 项目部施工", "项目部根据已确定的需求立项组织施工。"),
+        ("7. 总部运行保障部", "督促一线需求稳定，协调总部相关部门把控需求，输出给不动产进行招采、施工。"),
+        ("8. 施工验收", "总部运行保障部督促一线园区进行最终施工验收。"),
+    ]
+    for title, desc in steps:
+        st.markdown(f"- **{title}**：{desc}")
+    st.divider()
+
+
+def render_项目统计分析(df: pd.DataFrame, 园区选择: list):
+    """项目统计分析：数量费用统计、预算差值、确定/未确定项目分析、按月份统计立项。"""
+    st.subheader("项目统计分析")
+    # 处理园区选择：如果为空或None，显示所有有园区信息的数据
+    if 园区选择 and len(园区选择) > 0:
+        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
+        if valid_parks:
+            sub = df[df["园区"].isin(valid_parks)]
+        else:
+            sub = df[df["园区"].notna()]
+    else:
+        sub = df[df["园区"].notna()]  # 只显示有园区信息的行
+    
+    # 过滤掉汇总行（序号为空或为"合计"等）
+    if "序号" in sub.columns:
+        sub = sub[sub["序号"].notna()]
+        # 过滤掉合计行
+        sub = sub[~sub["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
+        # 确保序号是数字（过滤掉非数字的序号）
+        sub = sub[pd.to_numeric(sub["序号"], errors='coerce').notna()]
+    else:
+        st.warning("数据中未找到'序号'列，无法进行统计分析。")
+        return
+    
+    # 标签池：先选择需要分析的字段，再展示对应统计
+    st.markdown("### 🔖 标签池（选择需要分析的字段）")
+    all_tags = [
+        "社区（园区）",
+        "所属区域",
+        "所属业态",
+        "项目分级",
+        "项目分类",
+        "拟定承建组织",
+        "总部重点关注项目",
+        "专业",
+        "专业分包",
+        "项目名称",
+        "备注说明",
+        "拟定金额",
+    ]
+    default_tags = st.session_state.get(
+        "tag_pool_selection",
+        ["社区（园区）", "所属区域", "项目分级", "专业", "专业分包", "拟定金额"],
+    )
+    selected_tags = st.multiselect(
+        "请选择本次分析要关注的字段（至少选择一个）：",
+        options=all_tags,
+        default=[t for t in default_tags if t in all_tags],
+        help=(
+            "示例：\n"
+            "- 只看区域对比：勾选「所属区域」「拟定金额」。\n"
+            "- 看分级与专业：勾选「项目分级」「专业」「拟定金额」。\n"
+            "- 只看社区层面的统计：勾选「社区（园区）」「拟定金额」。"
+        ),
+    )
+    st.session_state["tag_pool_selection"] = selected_tags
+
+    if not selected_tags:
+        st.info("请先在上方的标签池中至少选择一个字段，然后将根据选择展示对应的统计图表。")
+        return
+
+    show_park = "社区（园区）" in selected_tags
+    show_region = "所属区域" in selected_tags
+    show_prof_subcontract = "专业分包" in selected_tags
+    show_level_stats = "项目分级" in selected_tags
+    use_amount_filter = "拟定金额" in selected_tags
+    show_business_type = "所属业态" in selected_tags
+    show_category = "项目分类" in selected_tags
+    show_contractor = "拟定承建组织" in selected_tags
+    show_focus = "总部重点关注项目" in selected_tags
+    show_prof = "专业" in selected_tags
+
+    # 按标签构造筛选条件，例如：华东地区 + 一级项目 + 金额区间
+    st.markdown("### 🎯 标签筛选条件（可选）")
+    col_region, col_level, col_amount = st.columns(3)
+    selected_regions = []
+    selected_levels = []
+    amount_min = amount_max = None
+    selected_business_types = []
+    selected_categories = []
+    selected_contractors = []
+    selected_focus = []
+    selected_profs = []
+    selected_prof_subcontracts = []
+
+    # 用于级联下钻的临时 DataFrame：每选择一层，就用该层结果作为下一层可选值的来源
+    sub_for_opts = sub.copy()
+
+    if show_region and "所属区域" in sub_for_opts.columns:
+        with col_region:
+            region_opts = (
+                sub_for_opts["所属区域"]
+                .dropna()
+                .astype(str)
+                .replace("其他", pd.NA)
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            region_opts = sorted(region_opts)
+            selected_regions = st.multiselect(
+                "选择所属区域",
+                options=region_opts,
+                help="例如：只看华东地区时，勾选「华东」。可多选。",
+            )
+            if selected_regions:
+                sub_for_opts = sub_for_opts[sub_for_opts["所属区域"].isin(selected_regions)]
+
+    if show_level_stats and "项目分级" in sub_for_opts.columns:
+        with col_level:
+            level_opts = (
+                sub_for_opts["项目分级"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+            level_opts = sorted(level_opts)
+            selected_levels = st.multiselect(
+                "选择项目分级",
+                options=level_opts,
+                help="例如：只看一级项目时，勾选「一级」。可多选。",
+            )
+            if selected_levels:
+                sub_for_opts = sub_for_opts[sub_for_opts["项目分级"].isin(selected_levels)]
+
+    if use_amount_filter and "拟定金额" in sub_for_opts.columns:
+        with col_amount:
+            try:
+                min_val = float(sub_for_opts["拟定金额"].min() or 0)
+                max_val = float(sub_for_opts["拟定金额"].max() or 0)
+            except Exception:
+                min_val, max_val = 0.0, 0.0
+            if max_val < min_val:
+                max_val = min_val
+            if min_val == max_val:
+                amount_min, amount_max = min_val, max_val
+                st.write(f"拟定金额范围：{min_val:,.0f} 万元")
+            else:
+                amount_min, amount_max = st.slider(
+                    "拟定金额范围（万元）",
+                    min_value=float(min_val),
+                    max_value=float(max_val),
+                    value=(float(min_val), float(max_val)),
+                    step=max(1.0, (max_val - min_val) / 100),
+                    help="例如：选择最大值为 500，则表示筛选「五百万以内」的项目。",
+                )
+
+    # 其他标签字段的多选筛选
+    if use_amount_filter and amount_min is not None and amount_max is not None and "拟定金额" in sub_for_opts.columns:
+        sub_for_opts = sub_for_opts[
+            (sub_for_opts["拟定金额"] >= amount_min) & (sub_for_opts["拟定金额"] <= amount_max)
+        ]
+
+    if show_business_type and "项目业态" in sub_for_opts.columns:
+        business_opts = (
+            sub_for_opts["项目业态"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        business_opts = sorted(business_opts)
+        selected_business_types = st.multiselect(
+            "选择所属业态",
+            options=business_opts,
+            help="例如：只看某一业态的项目时，在此勾选对应业态。",
+        )
+
+        if selected_business_types:
+            sub_for_opts = sub_for_opts[sub_for_opts["项目业态"].isin(selected_business_types)]
+
+    if show_category and "项目分类" in sub_for_opts.columns:
+        category_opts = (
+            sub_for_opts["项目分类"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        category_opts = sorted(category_opts)
+        selected_categories = st.multiselect(
+            "选择项目分类",
+            options=category_opts,
+            help="例如：只看某一类项目时，在此勾选对应分类。",
+        )
+
+        if selected_categories:
+            sub_for_opts = sub_for_opts[sub_for_opts["项目分类"].isin(selected_categories)]
+
+    if show_contractor and "拟定承建组织" in sub_for_opts.columns:
+        contractor_opts = (
+            sub_for_opts["拟定承建组织"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        contractor_opts = sorted(contractor_opts)
+        selected_contractors = st.multiselect(
+            "选择拟定承建组织",
+            options=contractor_opts,
+            help="例如：只看由某个承建组织负责的项目时，在此勾选对应承建组织。",
+        )
+
+        if selected_contractors:
+            sub_for_opts = sub_for_opts[sub_for_opts["拟定承建组织"].isin(selected_contractors)]
+
+    if show_focus and "总部重点关注项目" in sub_for_opts.columns:
+        focus_opts = (
+            sub_for_opts["总部重点关注项目"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        focus_opts = sorted(focus_opts)
+        selected_focus = st.multiselect(
+            "选择总部重点关注项目标记",
+            options=focus_opts,
+            help="例如：只看总部重点关注的项目时，在此勾选「是」或对应标记。",
+        )
+
+        if selected_focus:
+            sub_for_opts = sub_for_opts[sub_for_opts["总部重点关注项目"].isin(selected_focus)]
+
+    if show_prof and "专业" in sub_for_opts.columns:
+        prof_opts = (
+            sub_for_opts["专业"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+        prof_opts = sorted(prof_opts)
+        selected_profs = st.multiselect(
+            "选择专业",
+            options=prof_opts,
+            help="例如：只看电梯系统或供配电系统等某几个专业。",
+        )
+
+        if selected_profs:
+            sub_for_opts = sub_for_opts[sub_for_opts["专业"].isin(selected_profs)]
+
+    if show_prof_subcontract and ("专业分包" in sub_for_opts.columns or "专业细分" in sub_for_opts.columns):
+        col_name = "专业分包" if "专业分包" in sub_for_opts.columns else "专业细分"
+        sub_prof = sub_for_opts[col_name].dropna().astype(str)
+        prof_sub_opts = sorted(sub_prof.unique().tolist())
+        selected_prof_subcontracts = st.multiselect(
+            "选择专业分包",
+            options=prof_sub_opts,
+            help="例如：只看某几个专业分包类型。",
+        )
+
+    # 应用筛选条件到子集数据
+    if selected_regions:
+        sub = sub[sub["所属区域"].isin(selected_regions)]
+    if selected_levels:
+        sub = sub[sub["项目分级"].isin(selected_levels)]
+    if (
+        use_amount_filter
+        and amount_min is not None
+        and amount_max is not None
+        and "拟定金额" in sub.columns
+    ):
+        sub = sub[(sub["拟定金额"] >= amount_min) & (sub["拟定金额"] <= amount_max)]
+
+    if selected_business_types and "项目业态" in sub.columns:
+        sub = sub[sub["项目业态"].isin(selected_business_types)]
+    if selected_categories and "项目分类" in sub.columns:
+        sub = sub[sub["项目分类"].isin(selected_categories)]
+    if selected_contractors and "拟定承建组织" in sub.columns:
+        sub = sub[sub["拟定承建组织"].isin(selected_contractors)]
+    if selected_focus and "总部重点关注项目" in sub.columns:
+        sub = sub[sub["总部重点关注项目"].isin(selected_focus)]
+    if selected_profs and "专业" in sub.columns:
+        sub = sub[sub["专业"].isin(selected_profs)]
+    if selected_prof_subcontracts and ("专业分包" in sub.columns or "专业细分" in sub.columns):
+        col_name = "专业分包" if "专业分包" in sub.columns else "专业细分"
+        sub = sub[sub[col_name].astype(str).isin(selected_prof_subcontracts)]
+
+    if sub.empty:
+        st.warning("根据当前标签筛选条件，未找到任何项目，请调整区域 / 项目分级或金额范围后重试。")
+        return
+
+    # 1. 按数量和费用统计项目，计算与预算差值（只要选择了任意标签就展示整体概览）
+    st.markdown("### 📊 项目数量与费用统计")
+    total_count = len(sub)
+    total_amount = sub["拟定金额"].sum() if "拟定金额" in sub.columns else 0
+    
+    # 尝试从原始数据中提取预算系统合计（如果有汇总行）
+    budget_total = 0
+    # 方法1：从序号为空的汇总行中查找
+    if "序号" in df.columns:
+        budget_rows = df[df["序号"].isna() | (df["序号"].astype(str).str.strip() == "预算系统合计")]
+        if not budget_rows.empty:
+            for _, row in budget_rows.iterrows():
+                if "预算系统合计" in str(row.values):
+                    for col in ["拟定金额", "金额", "预算"]:
+                        if col in row.index:
+                            try:
+                                val = row[col]
+                                if pd.notna(val):
+                                    budget_total = float(val)
+                                    break
+                            except:
+                                continue
+                    if budget_total > 0:
+                        break
+        
+        # 方法2：从园区列包含"预算系统合计"的行中查找
+        if budget_total == 0 and "园区" in df.columns:
+            budget_rows = df[df["园区"].astype(str).str.contains("预算系统合计", na=False)]
+            if not budget_rows.empty:
+                for col in ["拟定金额", "金额", "预算"]:
+                    if col in budget_rows.columns:
+                        try:
+                            val = budget_rows.iloc[0][col]
+                            if pd.notna(val):
+                                budget_total = float(val)
+                                break
+                        except:
+                            continue
+    
+    diff = total_amount - budget_total
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("项目总数", f"{total_count:,}")
+    with col2:
+        st.metric("总金额（万元）", f"{total_amount:,.0f}")
+    with col3:
+        st.metric("预算系统合计（万元）", f"{budget_total:,.0f}" if budget_total > 0 else "未找到")
+    with col4:
+        st.metric("差值（万元）", f"{diff:,.0f}", delta=f"{diff:,.0f}" if diff != 0 else None)
+    
+    # 按园区统计（仅当在标签池中选择了“社区（园区）”时展示）
+    if show_park:
+        st.markdown("#### 按园区统计")
+        park_stats = sub.groupby("园区", dropna=False).agg(
+            项目数=("序号", "count"),
+            金额合计=("拟定金额", "sum"),
+        ).reset_index()
+        park_stats["金额合计"] = park_stats["金额合计"].round(2)
+        st.dataframe(park_stats, use_container_width=True, hide_index=True)
+    
+    # 按区域统计（仅当存在所属区域列且在标签池中勾选“所属区域”时展示）
+    if show_region and "所属区域" in sub.columns:
+        st.markdown("#### 按所属区域统计")
+        region_stats = sub.groupby("所属区域", dropna=False).agg(
+            项目数=("序号", "count"),
+            金额合计=("拟定金额", "sum"),
+            园区数=("园区", "nunique"),
+        ).reset_index()
+        region_stats = region_stats[region_stats["所属区域"] != "其他"].sort_values("项目数", ascending=False)
+        region_stats["金额合计"] = region_stats["金额合计"].round(2)
+        st.dataframe(region_stats, use_container_width=True, hide_index=True)
+        
+        # 区域下各园区明细
+        st.markdown("##### 各区域下园区明细")
+        for region in region_stats["所属区域"].unique():
+            region_df = sub[sub["所属区域"] == region]
+            parks_in_region = region_df.groupby("园区", dropna=False).agg(
+                项目数=("序号", "count"),
+                金额合计=("拟定金额", "sum"),
+            ).reset_index().sort_values("项目数", ascending=False)
+            parks_in_region["金额合计"] = parks_in_region["金额合计"].round(2)
+            
+            with st.expander(f"📌 {region}（{len(parks_in_region)}个园区，{int(parks_in_region['项目数'].sum())}个项目，{parks_in_region['金额合计'].sum():,.0f}万元）"):
+                st.dataframe(parks_in_region, use_container_width=True, hide_index=True)
+    
+    st.markdown("---")
+    
+    # 按专业分包统计（如果存在该列且在标签池中勾选“专业分包”）
+    if show_prof_subcontract and ("专业分包" in sub.columns or "专业细分" in sub.columns):
+        prof_subcontract_col = "专业分包" if "专业分包" in sub.columns else "专业细分"
+        # 若专业分包/细分几乎全为空，则自动回退到「专业」统计，避免全部落在空分类
+        effective_col = prof_subcontract_col
+        try:
+            nonempty = sub[prof_subcontract_col].astype(str).str.strip().ne("").sum()
+        except Exception:
+            nonempty = 0
+        if nonempty == 0 and "专业" in sub.columns:
+            effective_col = "专业"
+            st.info("当前数据的「专业分包/专业细分」为空，已自动改用「专业」进行统计。")
+
+        st.markdown("### 📦 按专业分包统计" if effective_col == prof_subcontract_col else "### 📦 按专业统计（替代专业分包）")
+        by_prof_subcontract = sub.groupby(effective_col, dropna=False).agg(
+            项目数=("序号", "count"),
+            金额合计=("拟定金额", "sum"),
+        ).reset_index().sort_values("金额合计", ascending=False)
+        by_prof_subcontract["金额合计"] = by_prof_subcontract["金额合计"].round(2)
+        by_prof_subcontract["项目数占比"] = (by_prof_subcontract["项目数"] / by_prof_subcontract["项目数"].sum() * 100).round(2)
+        by_prof_subcontract["金额占比"] = (by_prof_subcontract["金额合计"] / by_prof_subcontract["金额合计"].sum() * 100).round(2)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### 专业分包项目数统计" if effective_col == prof_subcontract_col else "#### 专业项目数统计")
+            st.dataframe(by_prof_subcontract[[effective_col, "项目数", "项目数占比"]], use_container_width=True, hide_index=True)
+        with col2:
+            st.markdown("#### 专业分包金额统计" if effective_col == prof_subcontract_col else "#### 专业金额统计")
+            st.dataframe(by_prof_subcontract[[effective_col, "金额合计", "金额占比"]], use_container_width=True, hide_index=True)
+        
+        # 显示图表
+        try:
+            import plotly.express as px
+            col1, col2 = st.columns(2)
+            with col1:
+                fig = px.pie(
+                    by_prof_subcontract, 
+                    values="项目数", 
+                    names=effective_col,
+                    title="专业分包项目数占比" if effective_col == prof_subcontract_col else "专业项目数占比",
+                    color_discrete_sequence=CHART_COLORS_PIE[:len(by_prof_subcontract)]
+                )
+                fig.update_traces(textposition="outside", textinfo="label+percent+value")
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            with col2:
+                fig = px.pie(
+                    by_prof_subcontract, 
+                    values="金额合计", 
+                    names=effective_col,
+                    title="专业分包金额占比" if effective_col == prof_subcontract_col else "专业金额占比",
+                    color_discrete_sequence=CHART_COLORS_PIE[:len(by_prof_subcontract)]
+                )
+                fig.update_traces(textposition="outside", textinfo="label+percent+value")
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            
+            # 专业与专业分包的交叉统计（仅当确实存在可用的专业分包/细分时展示）
+            if effective_col == prof_subcontract_col and "专业" in sub.columns:
+                st.markdown("#### 专业与专业分包交叉统计")
+                cross_stats = sub.groupby(["专业", prof_subcontract_col], dropna=False).agg(
+                    项目数=("序号", "count"),
+                    金额合计=("拟定金额", "sum"),
+                ).reset_index().sort_values("金额合计", ascending=False)
+                # 过滤掉"其它系统"分类
+                cross_stats = cross_stats[~cross_stats["专业"].isin(["其它系统", "其他系统"])]
+                cross_stats["金额合计"] = cross_stats["金额合计"].round(2)
+                st.dataframe(cross_stats, use_container_width=True, hide_index=True)
+        except ImportError:
+            pass
+    
+    st.markdown("---")
+    
+    # 2. 一类、二类、三类项目占比统计（仅当在标签池中勾选“项目分级”）
+    if show_level_stats:
+        st.markdown("### 📈 项目分级占比统计")
+    if show_level_stats and "项目分级" in sub.columns:
+        # 映射：一级->一类，二级->二类，三级->三类
+        level_mapping = {"一级": "一类", "二级": "二类", "三级": "三类"}
+        sub_copy = sub.copy()
+        sub_copy["项目类别"] = sub_copy["项目分级"].map(level_mapping).fillna(sub_copy["项目分级"])
+        
+        level_stats = sub_copy.groupby("项目类别", dropna=False).agg(
+            项目数=("序号", "count"),
+            金额合计=("拟定金额", "sum"),
+        ).reset_index()
+        
+        total_projects = level_stats["项目数"].sum()
+        total_amount_level = level_stats["金额合计"].sum()
+        
+        if total_projects > 0:
+            level_stats["项目数占比"] = (level_stats["项目数"] / total_projects * 100).round(2)
+            level_stats["金额占比"] = (level_stats["金额合计"] / total_amount_level * 100).round(2) if total_amount_level > 0 else 0
+            level_stats["金额合计"] = level_stats["金额合计"].round(2)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("#### 项目数量占比")
+                st.dataframe(level_stats[["项目类别", "项目数", "项目数占比"]], use_container_width=True, hide_index=True)
+            with col2:
+                st.markdown("#### 项目金额占比")
+                st.dataframe(level_stats[["项目类别", "金额合计", "金额占比"]], use_container_width=True, hide_index=True)
+            
+            # 显示饼图
+            try:
+                import plotly.express as px
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig = px.pie(
+                        level_stats, values="项目数", names="项目类别",
+                        title="项目数量占比",
+                        color_discrete_sequence=["#FF6B6B", "#4ECDC4", "#45B7D1"]
+                    )
+                    fig.update_traces(textposition="outside", textinfo="label+percent+value")
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                with col2:
+                    fig = px.pie(
+                        level_stats, values="金额合计", names="项目类别",
+                        title="项目金额占比",
+                        color_discrete_sequence=["#FF6B6B", "#4ECDC4", "#45B7D1"]
+                    )
+                    fig.update_traces(textposition="outside", textinfo="label+percent+value")
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            except ImportError:
+                pass
+        else:
+            st.info("暂无项目分级数据。")
+    else:
+        st.info("未找到项目分级列，无法进行分级占比统计。")
+    
+    st.markdown("---")
+    
+    # 3. 是否已实施判断
+    st.markdown("### 🔧 项目实施状态分析")
+    impl_col = None
+    for col in sub.columns:
+        col_str = str(col).strip()
+        if "实施" in col_str and "时间" not in col_str.lower():
+            impl_col = col
+            break
+    
+    if impl_col:
+        # 解析实施日期
+        def parse_impl_date(series):
+            """解析实施日期，支持Excel日期序列号、datetime、字符串格式"""
+            result = pd.Series(pd.NaT, index=series.index, dtype='datetime64[ns]')
+            
+            if pd.api.types.is_datetime64_any_dtype(series):
+                result = pd.to_datetime(series, errors='coerce')
+                result = result.mask(result.dt.year == 1900, pd.NaT)
+                return result
+            
+            numeric = pd.to_numeric(series, errors='coerce')
+            excel_mask = pd.Series(False, index=series.index)
+            if numeric.notna().any():
+                excel_mask = (numeric >= 1) & (numeric <= 100000) & numeric.notna()
+                if excel_mask.any():
+                    result.loc[excel_mask] = pd.to_datetime(
+                        numeric[excel_mask].astype(int),
+                        unit='D',
+                        origin='1899-12-30'
+                    )
+                    result = result.mask(result.dt.year == 1900, pd.NaT)
+            
+            str_mask = ~excel_mask & result.isna()
+            if str_mask.any():
+                str_series = series[str_mask].astype(str).str.strip()
+                str_series = str_series.replace(['', 'nan', 'None', 'NaT'], pd.NA)
+                str_mask2 = ~str_series.str.startswith('1900', na=False)
+                str_parse = pd.to_datetime(str_series[str_mask2], format='mixed', errors='coerce')
+                result.loc[str_mask] = str_parse
+            
+            return result
+        
+        sub_copy = sub.copy()
+        sub_copy["_实施日期_parsed"] = parse_impl_date(sub_copy[impl_col])
+        
+        # 获取当前时间
+        current_time = datetime.now()
+        sub_copy["已实施"] = sub_copy["_实施日期_parsed"].notna() & (sub_copy["_实施日期_parsed"] <= pd.Timestamp(current_time))
+        
+        已实施项目 = sub_copy[sub_copy["已实施"]]
+        未实施项目 = sub_copy[~sub_copy["已实施"]]
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("已实施项目数", len(已实施项目))
+            st.metric("已实施金额（万元）", f"{已实施项目['拟定金额'].sum():,.0f}" if len(已实施项目) > 0 else "0")
+        with col2:
+            st.metric("未实施项目数", len(未实施项目))
+            st.metric("未实施金额（万元）", f"{未实施项目['拟定金额'].sum():,.0f}" if len(未实施项目) > 0 else "0")
+        with col3:
+            total_impl = len(sub_copy)
+            if total_impl > 0:
+                impl_rate = len(已实施项目) / total_impl * 100
+                st.metric("实施率", f"{impl_rate:.1f}%")
+            else:
+                st.metric("实施率", "0%")
+        
+        # 按园区统计实施情况
+        st.markdown("#### 各园区实施情况统计")
+        park_impl_list = []
+        for park in sub_copy["园区"].dropna().unique():
+            park_df = sub_copy[sub_copy["园区"] == park]
+            总项目数 = len(park_df)
+            已实施数 = park_df["已实施"].sum()
+            总金额 = park_df["拟定金额"].sum()
+            已实施金额 = park_df[park_df["已实施"]]["拟定金额"].sum()
+            park_impl_list.append({
+                "园区": park,
+                "总项目数": 总项目数,
+                "已实施数": int(已实施数),
+                "未实施数": int(总项目数 - 已实施数),
+                "总金额": round(总金额, 2),
+                "已实施金额": round(已实施金额, 2),
+                "实施率": round(已实施数 / 总项目数 * 100, 1) if 总项目数 > 0 else 0,
+            })
+        park_impl_stats = pd.DataFrame(park_impl_list).sort_values("总金额", ascending=False)
+        st.dataframe(park_impl_stats, use_container_width=True, hide_index=True)
+    else:
+        st.info("未找到实施日期列，无法进行实施状态分析。")
+    
+    st.markdown("---")
+    
+    # 4. 各园区的分类统计：一级项目、总部项目、重大改造项目（200万以上）
+    st.markdown("### 🏢 各园区分类项目统计")
+    
+    # 准备数据
+    park_analysis = []
+    for park in sub["园区"].dropna().unique():
+        park_df = sub[sub["园区"] == park]
+        
+        # 一级项目金额（支持多种格式：一级、1级、一级项目、1等）
+        if "项目分级" in park_df.columns:
+            # 将项目分级转换为字符串并去除空格，然后匹配包含"一级"、"1级"或数字"1"的值
+            # 先尝试字符串匹配
+            一级项目_str = park_df[
+                park_df["项目分级"].astype(str).str.strip().str.contains("一级|1级", na=False, regex=True)
+            ]
+            # 再尝试数字匹配（如果是数字1）
+            try:
+                一级项目_num = park_df[pd.to_numeric(park_df["项目分级"], errors='coerce') == 1]
+            except:
+                一级项目_num = pd.DataFrame()
+            # 合并两种匹配结果
+            一级项目 = pd.concat([一级项目_str, 一级项目_num]).drop_duplicates()
+        else:
+            一级项目 = pd.DataFrame()
+        一级项目金额 = 一级项目["拟定金额"].sum() if len(一级项目) > 0 else 0
+        
+        # 总部项目金额（总部重点关注项目列为"是"的项目）
+        if "总部重点关注项目" in park_df.columns:
+            总部项目 = park_df[
+                park_df["总部重点关注项目"].astype(str).str.strip().str.contains("是", na=False, case=False)
+            ]
+        else:
+            总部项目 = pd.DataFrame()
+        总部项目金额 = 总部项目["拟定金额"].sum() if len(总部项目) > 0 else 0
+        
+        # 重大改造项目（单个200万以上）
+        重大改造项目 = park_df[park_df["拟定金额"] >= 200]
+        重大改造项目金额 = 重大改造项目["拟定金额"].sum() if len(重大改造项目) > 0 else 0
+        重大改造项目数 = len(重大改造项目)
+        
+        # 总金额
+        总金额 = park_df["拟定金额"].sum()
+        
+        park_analysis.append({
+            "园区": park,
+            "一级项目金额": round(一级项目金额, 2),
+            "一级项目占比": round(一级项目金额 / 总金额 * 100, 2) if 总金额 > 0 else 0,
+            "总部项目金额": round(总部项目金额, 2),
+            "总部项目占比": round(总部项目金额 / 总金额 * 100, 2) if 总金额 > 0 else 0,
+            "重大改造项目数": 重大改造项目数,
+            "重大改造项目金额": round(重大改造项目金额, 2),
+            "重大改造项目占比": round(重大改造项目金额 / 总金额 * 100, 2) if 总金额 > 0 else 0,
+            "总金额": round(总金额, 2),
+        })
+    
+    park_analysis_df = pd.DataFrame(park_analysis)
+    park_analysis_df = park_analysis_df.sort_values("总金额", ascending=False)
+    
+    st.dataframe(park_analysis_df, use_container_width=True, hide_index=True)
+    
+    # 显示金额汇总信息
+    total_level1 = park_analysis_df["一级项目金额"].sum()
+    total_hq = park_analysis_df["总部项目金额"].sum()
+    total_major = park_analysis_df["重大改造项目金额"].sum()
+    total_all = park_analysis_df["总金额"].sum()
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("一级项目总金额", f"{total_level1:,.0f} 万元")
+    with col2:
+        st.metric("总部项目总金额", f"{total_hq:,.0f} 万元")
+    with col3:
+        st.metric("重大改造项目总金额", f"{total_major:,.0f} 万元")
+    with col4:
+        st.metric("所有项目总金额", f"{total_all:,.0f} 万元")
+    
+    st.markdown("---")
+    
+    # 显示整合图表（合并到同一个坐标轴下，优化版）
+    try:
+        import plotly.graph_objects as go
+        
+        # 按总金额排序，确保图表顺序一致
+        park_analysis_df_sorted = park_analysis_df.sort_values("总金额", ascending=False)
+        
+        # 创建单一图表，使用三Y轴（左Y轴：金额，中Y轴：项目数，右Y轴：占比）
+        fig = go.Figure()
+        
+        # 左Y轴：金额（柱状图）
+        # 1. 一级项目金额
+        fig.add_trace(
+            go.Bar(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["一级项目金额"],
+                name="一级项目金额（万元）",
+                marker=dict(
+                    color="#5470c6",
+                    line=dict(color="#3a5a9c", width=1)
+                ),
+                text=park_analysis_df_sorted["一级项目金额"].apply(lambda x: f"{int(x)}万" if x > 0 else None),
+                textposition="outside",
+                textfont=dict(size=12, color="#5470c6"),
+                hovertemplate="<b>%{x}</b><br>一级项目金额: %{y:,.0f} 万元<extra></extra>",
+                yaxis="y",
+                cliponaxis=False
+            )
+        )
+        
+        # 2. 总部项目金额
+        fig.add_trace(
+            go.Bar(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["总部项目金额"],
+                name="总部项目金额（万元）",
+                marker=dict(
+                    color="#91cc75",
+                    line=dict(color="#6fa85a", width=1)
+                ),
+                text=park_analysis_df_sorted["总部项目金额"].apply(lambda x: f"{int(x)}万" if x > 0 else None),
+                textposition="outside",
+                textfont=dict(size=12, color="#91cc75"),
+                hovertemplate="<b>%{x}</b><br>总部项目金额: %{y:,.0f} 万元<extra></extra>",
+                yaxis="y",
+                cliponaxis=False
+            )
+        )
+        
+        # 3. 重大改造项目金额
+        fig.add_trace(
+            go.Bar(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["重大改造项目金额"],
+                name="重大改造项目金额（万元）",
+                marker=dict(
+                    color="#fac858",
+                    line=dict(color="#d4a84a", width=1)
+                ),
+                text=park_analysis_df_sorted["重大改造项目金额"].apply(lambda x: f"{int(x)}万" if x > 0 else None),
+                textposition="outside",
+                textfont=dict(size=12, color="#d4a84a"),
+                hovertemplate="<b>%{x}</b><br>重大改造项目金额: %{y:,.0f} 万元<extra></extra>",
+                yaxis="y",
+                cliponaxis=False
+            )
+        )
+        
+        # 中Y轴：项目数量（使用独立的Y轴，避免缩放）
+        max_amount = max(
+            park_analysis_df_sorted["一级项目金额"].max(),
+            park_analysis_df_sorted["总部项目金额"].max(),
+            park_analysis_df_sorted["重大改造项目金额"].max()
+        )
+        max_count = park_analysis_df_sorted["重大改造项目数"].max()
+        # 计算缩放因子，使项目数在视觉上与金额协调
+        if max_count > 0 and max_amount > 0:
+            scale_factor = max_amount / (max_count * 50)  # 调整缩放比例
+        else:
+            scale_factor = 1
+        scaled_count = park_analysis_df_sorted["重大改造项目数"] * scale_factor
+        
+        # 4. 重大改造项目数量
+        fig.add_trace(
+            go.Bar(
+                x=park_analysis_df_sorted["园区"],
+                y=scaled_count,
+                name="重大改造项目数（个）",
+                marker=dict(
+                    color="#73c0de",
+                    line=dict(color="#4a9bc0", width=1.5)
+                ),
+                text=park_analysis_df_sorted["重大改造项目数"].apply(lambda x: f"{int(x)}个" if x > 0 else None),
+                textposition="inside",
+                textfont=dict(size=11, color="#ffffff"),
+                customdata=list(zip(
+                    park_analysis_df_sorted["重大改造项目数"],
+                    park_analysis_df_sorted["重大改造项目金额"]
+                )),
+                hovertemplate="<b>%{x}</b><br>重大改造项目数: %{customdata[0]:.0f} 个<br>重大改造项目金额: %{customdata[1]:,.0f} 万元<extra></extra>",
+                yaxis="y",
+                opacity=0.85,
+                cliponaxis=False
+            )
+        )
+        
+        # 右Y轴：占比（折线图）
+        # 5. 一级项目占比
+        fig.add_trace(
+            go.Scatter(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["一级项目占比"],
+                name="一级项目占比（%）",
+                mode="lines+markers",
+                marker=dict(
+                    color="#ee6666",
+                    size=10,
+                    line=dict(width=2, color="white"),
+                    symbol="circle"
+                ),
+                line=dict(color="#ee6666", width=3),
+                text=park_analysis_df_sorted["一级项目占比"].apply(lambda x: f"{x:.0f}%" if x > 0 else None),
+                textposition="top center",
+                textfont=dict(size=11, color="#ee6666"),
+                customdata=park_analysis_df_sorted["一级项目金额"],
+                hovertemplate="<b>%{x}</b><br>一级项目占比: %{y:.1f}%<br>一级项目金额: %{customdata:,.0f} 万元<extra></extra>",
+                yaxis="y2",
+                cliponaxis=False
+            )
+        )
+        
+        # 6. 总部项目占比
+        fig.add_trace(
+            go.Scatter(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["总部项目占比"],
+                name="总部项目占比（%）",
+                mode="lines+markers",
+                marker=dict(
+                    color="#ff9800",
+                    size=10,
+                    line=dict(width=2, color="white"),
+                    symbol="square"
+                ),
+                line=dict(color="#ff9800", width=3, dash="dash"),
+                text=park_analysis_df_sorted["总部项目占比"].apply(lambda x: f"{x:.0f}%" if x > 0 else None),
+                textposition="top center",
+                textfont=dict(size=11, color="#ff9800"),
+                customdata=park_analysis_df_sorted["总部项目金额"],
+                hovertemplate="<b>%{x}</b><br>总部项目占比: %{y:.1f}%<br>总部项目金额: %{customdata:,.0f} 万元<extra></extra>",
+                yaxis="y2",
+                cliponaxis=False
+            )
+        )
+        
+        # 7. 重大改造项目占比
+        fig.add_trace(
+            go.Scatter(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["重大改造项目占比"],
+                name="重大改造项目占比（%）",
+                mode="lines+markers",
+                marker=dict(
+                    color="#9c27b0",
+                    size=10,
+                    line=dict(width=2, color="white"),
+                    symbol="diamond"
+                ),
+                line=dict(color="#9c27b0", width=3, dash="dot"),
+                text=park_analysis_df_sorted["重大改造项目占比"].apply(lambda x: f"{x:.0f}%" if x > 0 else None),
+                textposition="top center",
+                textfont=dict(size=11, color="#9c27b0"),
+                customdata=park_analysis_df_sorted["重大改造项目金额"],
+                hovertemplate="<b>%{x}</b><br>重大改造项目占比: %{y:.1f}%<br>重大改造项目金额: %{customdata:,.0f} 万元<extra></extra>",
+                yaxis="y2",
+                cliponaxis=False
+            )
+        )
+        
+        # 更新X轴
+        fig.update_xaxes(
+            tickangle=-45,
+            tickfont=dict(size=11),
+            title_text="园区",
+            title_font=dict(size=13, color="#333"),
+            showgrid=True,
+            gridcolor="rgba(200,200,200,0.3)",
+            gridwidth=1,
+            showline=True,
+            linecolor="#ccc",
+            linewidth=1
+        )
+        
+        # 更新左Y轴（金额）
+        fig.update_yaxes(
+            title_text="金额（万元）",
+            title_font=dict(size=13, color="#333"),
+            tickfont=dict(size=11),
+            side="left",
+            showgrid=True,
+            gridcolor="rgba(200,200,200,0.3)",
+            gridwidth=1,
+            showline=True,
+            linecolor="#5470c6",
+            linewidth=2,
+            zeroline=True,
+            zerolinecolor="rgba(200,200,200,0.5)",
+            zerolinewidth=1
+        )
+        
+        # 更新右Y轴（占比）
+        fig.update_yaxes(
+            title_text="占比（%）",
+            title_font=dict(size=13, color="#333"),
+            tickfont=dict(size=11),
+            side="right",
+            overlaying="y",
+            range=[0, 105],
+            showgrid=False,
+            showline=True,
+            linecolor="#ee6666",
+            linewidth=2
+        )
+        
+        # 更新整体布局
+        fig.update_layout(
+            height=700,
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=-0.18,
+                xanchor="center",
+                x=0.5,
+                font=dict(size=11),
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor="rgba(0,0,0,0.3)",
+                borderwidth=1,
+                itemwidth=30
+            ),
+            title=dict(
+                text="<b>各园区分类项目统计（金额、项目数与占比）</b>",
+                x=0.5,
+                xanchor="center",
+                y=0.97,
+                yanchor="top",
+                font=dict(size=18, family="Arial, sans-serif", color="#1f4788")
+            ),
+            margin=dict(t=100, b=160, l=90, r=90),
+            plot_bgcolor="rgba(255,255,255,1)",
+            paper_bgcolor="white",
+            barmode="group",
+            bargap=0.15,
+            bargroupgap=0.1,
+            hovermode="x unified",
+            hoverlabel=dict(
+                bgcolor="rgba(255,255,255,0.95)",
+                bordercolor="#333",
+                font_size=12,
+                font_family="Arial"
+            )
+        )
+        
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        
+        # 添加一个新的金额统计图表：分组柱状图，使用对数刻度以保证小金额园区的可见性
+        st.markdown("#### 📊 各园区分类项目金额统计（对数刻度）")
+        fig_amount = go.Figure()
+        
+        # 分组柱状图：一级项目金额、总部项目金额、重大改造项目金额
+        fig_amount.add_trace(
+            go.Bar(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["一级项目金额"],
+                name="一级项目金额（万元）",
+                marker=dict(color="#5470c6", line=dict(color="#3a5a9c", width=1)),
+                text=park_analysis_df_sorted["一级项目金额"].apply(lambda x: f"{int(x)}" if x > 0 else ""),
+                textposition="outside",
+                textfont=dict(size=9, color="#5470c6"),
+                hovertemplate="<b>%{x}</b><br>一级项目金额: %{y:,.0f} 万元<extra></extra>"
+            )
+        )
+        
+        fig_amount.add_trace(
+            go.Bar(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["总部项目金额"],
+                name="总部项目金额（万元）",
+                marker=dict(color="#91cc75", line=dict(color="#6fa85a", width=1)),
+                text=park_analysis_df_sorted["总部项目金额"].apply(lambda x: f"{int(x)}" if x > 0 else ""),
+                textposition="outside",
+                textfont=dict(size=9, color="#91cc75"),
+                hovertemplate="<b>%{x}</b><br>总部项目金额: %{y:,.0f} 万元<extra></extra>"
+            )
+        )
+        
+        fig_amount.add_trace(
+            go.Bar(
+                x=park_analysis_df_sorted["园区"],
+                y=park_analysis_df_sorted["重大改造项目金额"],
+                name="重大改造项目金额（万元）",
+                marker=dict(color="#fac858", line=dict(color="#d4a84a", width=1)),
+                text=park_analysis_df_sorted["重大改造项目金额"].apply(lambda x: f"{int(x)}" if x > 0 else ""),
+                textposition="outside",
+                textfont=dict(size=9, color="#d4a84a"),
+                hovertemplate="<b>%{x}</b><br>重大改造项目金额: %{y:,.0f} 万元<extra></extra>"
+            )
+        )
+        
+        fig_amount.update_xaxes(
+            tickangle=-45,
+            tickfont=dict(size=11),
+            title_text="园区",
+            title_font=dict(size=13, color="#333"),
+            showgrid=True,
+            gridcolor="rgba(200,200,200,0.3)"
+        )
+        
+        # 计算Y轴范围，使用对数刻度以保证小金额园区的可见性
+        import math
+        max_amount = park_analysis_df_sorted["总金额"].max()
+        min_amount = park_analysis_df_sorted[park_analysis_df_sorted["总金额"] > 0]["总金额"].min()
+        
+        # 生成对数刻度的不均匀标签
+        if max_amount > 0 and min_amount > 0 and not math.isnan(min_amount) and max_amount > min_amount * 2:
+            # 计算对数范围
+            log_min = math.log10(max(1, min_amount))  # 确保最小值至少为1
+            log_max = math.log10(max_amount)
+            
+            # 生成不均匀的刻度值（对数间隔）
+            tick_vals = []
+            tick_texts = []
+            
+            # 生成主要刻度：1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000等
+            for exp in range(int(math.floor(log_min)), int(math.ceil(log_max)) + 1):
+                for multiplier in [1, 2, 5]:
+                    val = multiplier * (10 ** exp)
+                    if val >= max(1, min_amount * 0.5) and val <= max_amount * 1.5:
+                        tick_vals.append(val)
+                        if val >= 1000:
+                            tick_texts.append(f"{val/1000:.1f}千")
+                        elif val >= 100:
+                            tick_texts.append(f"{int(val)}")
+                        else:
+                            tick_texts.append(f"{val}")
+            
+            # 去重并排序
+            tick_pairs = sorted(set(zip(tick_vals, tick_texts)), key=lambda x: x[0])
+            tick_vals = [v for v, _ in tick_pairs]
+            tick_texts = [t for _, t in tick_pairs]
+        else:
+            tick_vals = None
+            tick_texts = None
+        
+        fig_amount.update_yaxes(
+            title_text="金额（万元，对数刻度）",
+            title_font=dict(size=13, color="#333"),
+            tickfont=dict(size=10),
+            showgrid=True,
+            gridcolor="rgba(200,200,200,0.3)",
+            type="log",  # 使用对数刻度
+            tickvals=tick_vals if tick_vals else None,
+            ticktext=tick_texts if tick_texts else None,
+            dtick=1  # 对数刻度的步长
+        )
+        
+        fig_amount.update_layout(
+            height=600,
+            barmode="group",  # 使用分组模式，支持对数刻度
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=-0.15,
+                xanchor="center",
+                x=0.5,
+                font=dict(size=11)
+            ),
+            title=dict(
+                text="<b>各园区分类项目金额统计（对数刻度，保证小金额园区可见性）</b>",
+                x=0.5,
+                xanchor="center",
+                y=0.97,
+                yanchor="top",
+                font=dict(size=16, color="#1f4788")
+            ),
+            margin=dict(t=80, b=140, l=80, r=40),
+            plot_bgcolor="rgba(255,255,255,1)",
+            paper_bgcolor="white",
+            hovermode="x unified"
+        )
+        
+        st.plotly_chart(fig_amount, use_container_width=True, config={"displayModeBar": False})
+        
+    except ImportError:
+        # 如果plotly不可用，回退到简单的表格显示
+        st.info("图表库不可用，仅显示数据表格。")
+    except Exception as e:
+        st.warning(f"图表生成出错：{str(e)}")
+    
+    st.markdown("---")
+    
+    # 2. 确定项目（有立项日期）和未确定项目（无立项日期）分析
+    st.markdown("### ✅ 项目确定状态分析")
+    
+    # 查找立项日期列（支持多种可能的列名）
+    立项_col = None
+    for col in sub.columns:
+        col_str = str(col).strip()
+        # 支持多种列名格式
+        if any(keyword in col_str for keyword in ["需求立项", "项目立项", "立项日期", "立项"]):
+            # 排除包含"审核"、"决策"等其他时间节点的列
+            if "审核" not in col_str and "决策" not in col_str and "成本" not in col_str:
+                立项_col = col
+                break
+    
+    if 立项_col:
+        # 创建数据副本，避免修改原始数据
+        sub = sub.copy()
+        
+        # 解析日期列：支持Excel日期序列号、datetime对象、字符串等多种格式
+        def parse_date_series(series):
+            """解析日期序列，支持Excel日期序列号、datetime、字符串格式"""
+            result = pd.Series(pd.NaT, index=series.index, dtype='datetime64[ns]')
+            
+            # 1. 如果已经是datetime类型，直接使用
+            if pd.api.types.is_datetime64_any_dtype(series):
+                result = pd.to_datetime(series, errors='coerce')
+                # 过滤1900年的日期（Excel占位符）
+                result = result.mask(result.dt.year == 1900, pd.NaT)
+                return result
+            
+            # 2. 尝试解析为数值（Excel日期序列号）
+            numeric = pd.to_numeric(series, errors='coerce')
+            excel_mask = pd.Series(False, index=series.index)
+            if numeric.notna().any():
+                # Excel日期序列号范围：1-100000（约1900-2100年）
+                excel_mask = (numeric >= 1) & (numeric <= 100000) & numeric.notna()
+                if excel_mask.any():
+                    # Excel基准日期：1899-12-30
+                    result.loc[excel_mask] = pd.to_datetime(
+                        numeric[excel_mask].astype(int), 
+                        unit='D', 
+                        origin='1899-12-30'
+                    )
+                    # 过滤1900年的日期
+                    result = result.mask(result.dt.year == 1900, pd.NaT)
+            
+            # 3. 解析字符串格式的日期（仅对未成功解析为Excel序列号的部分）
+            str_mask = ~excel_mask & result.isna()
+            if str_mask.any():
+                str_series = series[str_mask].astype(str).str.strip()
+                str_series = str_series.replace(['', 'nan', 'None', 'NaT'], pd.NA)
+                # 过滤以1900开头的字符串
+                str_mask2 = ~str_series.str.startswith('1900', na=False)
+                str_parse = pd.to_datetime(str_series[str_mask2], format='mixed', errors='coerce')
+                result.loc[str_mask] = str_parse
+            
+            return result
+        
+        # 处理合并单元格：按园区向下填充空值
+        sub[立项_col] = sub[立项_col].replace('', pd.NA)
+        # 按园区和序号排序
+        sorted_idx = sub.sort_values(['园区', '序号']).index
+        # 按园区分组向下填充
+        sub.loc[sorted_idx, 立项_col] = sub.loc[sorted_idx].groupby('园区', sort=False)[立项_col].ffill()
+        
+        # 解析日期
+        sub["_立项日期_parsed"] = parse_date_series(sub[立项_col])
+        
+        # 判断是否有有效立项日期
+        sub["有立项日期"] = sub["_立项日期_parsed"].notna()
+        
+        确定项目 = sub[sub["有立项日期"]]
+        未确定项目 = sub[~sub["有立项日期"]]
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**已确定项目（有立项日期）**")
+            st.metric("项目数", len(确定项目))
+            st.metric("金额合计（万元）", f"{确定项目['拟定金额'].sum():,.0f}")
+            if not 确定项目.empty:
+                # 准备显示用的数据框
+                display_df = 确定项目[["园区", "序号", "项目名称", "拟定金额"]].copy()
+                # 添加格式化后的立项日期
+                if "_立项日期_parsed" in 确定项目.columns:
+                    display_df["立项日期"] = 确定项目["_立项日期_parsed"].dt.strftime("%Y-%m-%d")
+                else:
+                    display_df["立项日期"] = 确定项目[立项_col].astype(str)
+                st.dataframe(
+                    display_df.head(20),
+                    use_container_width=True,
+                    hide_index=True
+                )
+        
+        with col2:
+            st.markdown("**未确定项目（无立项日期）**")
+            st.metric("项目数", len(未确定项目))
+            st.metric("金额合计（万元）", f"{未确定项目['拟定金额'].sum():,.0f}")
+            if not 未确定项目.empty:
+                st.dataframe(
+                    未确定项目[["园区", "序号", "项目名称", "拟定金额"]].head(20),
+                    use_container_width=True,
+                    hide_index=True
+                )
+        
+        # 确定率统计
+        st.markdown("#### 确定率统计")
+        park_determination = sub.groupby("园区", dropna=False).agg(
+            总项目数=("序号", "count"),
+            已确定数=("有立项日期", "sum"),
+        ).reset_index()
+        park_determination["未确定数"] = park_determination["总项目数"] - park_determination["已确定数"]
+        park_determination["确定率"] = (park_determination["已确定数"] / park_determination["总项目数"] * 100).round(1)
+        st.dataframe(park_determination, use_container_width=True, hide_index=True)
+    else:
+        st.info("未找到立项日期列，无法进行确定/未确定项目分析。")
+    
+    st.markdown("---")
+    
+    # 3. 按月份统计立项
+    st.markdown("### 📅 按月份统计立项")
+    if 立项_col and "_立项日期_parsed" in sub.columns:
+        # 从已解析的日期列提取月份
+        sub["立项月份"] = sub["_立项日期_parsed"].dt.to_period('M').astype(str)
+        有月份的项目 = sub[sub["立项月份"].notna()]
+        
+        if not 有月份的项目.empty:
+            monthly_stats = 有月份的项目.groupby("立项月份", dropna=False).agg(
+                立项项目数=("序号", "count"),
+                立项金额=("拟定金额", "sum"),
+            ).reset_index().sort_values("立项月份")
+            monthly_stats["立项金额"] = monthly_stats["立项金额"].round(2)
+            
+            # 显示表格
+            st.dataframe(monthly_stats, use_container_width=True, hide_index=True)
+            
+            # 显示图表
+            try:
+                import plotly.express as px
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig = px.bar(
+                        monthly_stats, x="立项月份", y="立项项目数",
+                        title="每月立项项目数",
+                        text_auto=".0f"
+                    )
+                    fig.update_layout(xaxis_tickangle=-45, showlegend=False, height=350)
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                
+                with col2:
+                    fig = px.bar(
+                        monthly_stats, x="立项月份", y="立项金额",
+                        title="每月立项金额（万元）",
+                        text_auto=".0f"
+                    )
+                    fig.update_layout(xaxis_tickangle=-45, showlegend=False, height=350)
+                    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            except ImportError:
+                st.bar_chart(monthly_stats.set_index("立项月份"))
+        else:
+            st.info("暂无有效的立项日期数据。")
+    else:
+        st.info("未找到立项日期列，无法进行月份统计。")
+
+
+def _prepare_要点分析子集(df: pd.DataFrame, 园区选择: list) -> pd.DataFrame:
+    """过滤汇总行、按园区筛选，供「改良改造要点看板」复用。"""
+    if 园区选择 and len(园区选择) > 0:
+        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
+        sub = df[df["园区"].isin(valid_parks)] if valid_parks else df[df["园区"].notna()]
+    else:
+        sub = df[df["园区"].notna()]
+    if "序号" not in sub.columns:
+        return pd.DataFrame()
+    sub = sub[sub["序号"].notna()]
+    sub = sub[~sub["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
+    sub = sub[pd.to_numeric(sub["序号"], errors="coerce").notna()]
+    return sub
+
+
+def _parse_timeline_dates(series: pd.Series) -> pd.Series:
+    """解析进度表中的日期列（与项目统计分析中立项/实施解析逻辑一致）。"""
+    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if pd.api.types.is_datetime64_any_dtype(series):
+        result = pd.to_datetime(series, errors="coerce")
+        return result.mask(result.dt.year == 1900, pd.NaT)
+    numeric = pd.to_numeric(series, errors="coerce")
+    excel_mask = (numeric >= 1) & (numeric <= 100000) & numeric.notna()
+    if excel_mask.any():
+        result.loc[excel_mask] = pd.to_datetime(numeric[excel_mask].astype(int), unit="D", origin="1899-12-30")
+        result = result.mask(result.dt.year == 1900, pd.NaT)
+    str_mask = ~excel_mask & result.isna()
+    if str_mask.any():
+        str_series = series[str_mask].astype(str).str.strip().replace(["", "nan", "None", "NaT"], pd.NA)
+        str_mask2 = ~str_series.str.startswith("1900", na=False)
+        str_parse = pd.to_datetime(str_series[str_mask2], format="mixed", errors="coerce")
+        result.loc[str_mask] = str_parse
+    return result
+
+
+def _extract_budget_total_万元(df: pd.DataFrame) -> float:
+    """从汇总行提取预算系统合计（万元）。"""
+    budget_total = 0.0
+    if "序号" not in df.columns:
+        return budget_total
+    budget_rows = df[df["序号"].isna() | (df["序号"].astype(str).str.strip() == "预算系统合计")]
+    if not budget_rows.empty:
+        for _, row in budget_rows.iterrows():
+            if "预算系统合计" in str(row.values):
+                for col in ["拟定金额", "金额", "预算"]:
+                    if col in row.index and pd.notna(row[col]):
+                        try:
+                            budget_total = float(row[col])
+                            break
+                        except (TypeError, ValueError):
+                            continue
+                if budget_total > 0:
+                    break
+    if budget_total == 0 and "园区" in df.columns:
+        br = df[df["园区"].astype(str).str.contains("预算系统合计", na=False)]
+        if not br.empty:
+            for col in ["拟定金额", "金额", "预算"]:
+                if col in br.columns and pd.notna(br.iloc[0][col]):
+                    try:
+                        budget_total = float(br.iloc[0][col])
+                        break
+                    except (TypeError, ValueError):
+                        continue
+    return budget_total
+
+
+def render_改良改造要点看板(df: pd.DataFrame, 园区选择: list):
+    """
+    改良改造管理九项要点：预算、改造数量、分级/分类×区域、周/月执行、安全关键词、卡点、汇总与预警。
+    在数据缺口处用说明引导后续多维表字段补齐。
+    """
+    st.subheader("改良改造要点看板")
+    st.caption(
+        "对应管理要求：预算执行、改造数量、分级/分类与四大区域、周方案与月区域执行、施工安全关注、方案与施工卡点、月度汇总与滞后预警。"
+    )
+
+    sub = _prepare_要点分析子集(df, 园区选择)
+    if sub.empty:
+        st.warning("当前筛选下无有效项目行，请调整侧边栏园区筛选。")
+        return
+
+    四大区域 = ["华北", "华东", "华南", "西南"]
+    if "所属区域" in sub.columns:
+        sub = sub.copy()
+        sub["所属区域"] = sub["所属区域"].replace("", pd.NA).fillna(
+            sub["园区"].map(园区_TO_区域)
+        )
+    else:
+        sub = sub.copy()
+        sub["所属区域"] = sub["园区"].map(园区_TO_区域)
+
+    with st.expander("要点说明与数据建议", expanded=False):
+        st.markdown(
+            """
+**与九项要点的对应关系**
+
+1. **预算执行**：用「项目金额合计 vs 预算系统合计」看整体；各园区为**结构占比**（若需分园区预算，请在飞书表增加「园区预算」列）。
+2. **实际改造数量**：当前以**有效项目行数**为「已入库改造需求」；若另有「应改清单」总数，建议增加字段 **计划改造条数** 做达成率。
+3. **分级 / 分类 × 区域**：按 **项目分级、项目分类** 与 **所属区域**（华北/华东/华南/西南）交叉统计。
+4. **周 / 月执行**：周维度用 **规划设计方案** 填周；月维度用 **实施** 或 **立项** 填月，并按区域汇总。
+5. **施工安全**：在 **「地图与区域分析」** 中悬停园区点可查看关键词命中情况；正式管理建议在表中增加 **危险作业类型** 多选字段。
+6. **卡点**：用「**招采已有日期但实施为空**」等规则识别流程停滞；复杂卡点建议在 **备注** 中统一写「卡点：…」便于检索。
+7. **月度汇总与预警**：展示 **未立项金额**、**已立项未实施** ；预警列为 **未实施金额高** 或 **确定率偏低** 的园区。
+
+以下为根据**当前表结构**可自动计算的部分；字段不齐时页面会提示，而非静默省略。
+            """
+        )
+
+    budget_total = _extract_budget_total_万元(df)
+    total_amount = float(sub["拟定金额"].sum()) if "拟定金额" in sub.columns else 0.0
+    total_count = len(sub)
+
+    st.markdown("### 1）各园区相对预算的改良改造情况（结构 + 整体预算差）")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("有效改造项目数", f"{total_count:,}")
+    with c2:
+        st.metric("筛选范围内金额合计（万元）", f"{total_amount:,.0f}")
+    with c3:
+        st.metric("预算系统合计（万元）", f"{budget_total:,.0f}" if budget_total > 0 else "未识别")
+    with c4:
+        diff = total_amount - budget_total
+        st.metric("金额 − 预算（万元）", f"{diff:,.0f}" if budget_total > 0 else "—")
+    if "园区" in sub.columns and "拟定金额" in sub.columns:
+        park_amt = sub.groupby("园区", dropna=False)["拟定金额"].sum().reset_index()
+        park_amt["占筛选金额%"] = (park_amt["拟定金额"] / total_amount * 100).round(1) if total_amount > 0 else 0
+        park_amt = park_amt.sort_values("拟定金额", ascending=False)
+        st.dataframe(park_amt, use_container_width=True, hide_index=True)
+        st.caption("说明：分园区「预算额度」若未在表中维护，此处仅展示各园区金额占比，便于对照预算口径后手工核对。")
+
+    st.markdown("### 2）实际需要改造的数量情况（当前 = 已入库需求条数）")
+    st.metric("改造需求条数（序号有效行）", f"{total_count:,}")
+    st.info(
+        "若总部有单独的「应改造清单」总量，建议在多维表增加「是否计划内/计划序号」等字段，本页可再算 **达成率 = 已入库 / 计划**。"
+    )
+
+    st.markdown("### 3）按分级 × 四大区域的园区情况")
+    if "项目分级" in sub.columns and "所属区域" in sub.columns:
+        lv_reg = (
+            sub[sub["所属区域"].isin(四大区域)]
+            .groupby(["所属区域", "项目分级"], dropna=False)
+            .agg(项目数=("序号", "count"), 金额万元=("拟定金额", "sum"))
+            .reset_index()
+        )
+        try:
+            import plotly.express as px
+
+            fig = px.bar(
+                lv_reg,
+                x="所属区域",
+                y="金额万元",
+                color="项目分级",
+                barmode="group",
+                title="四大区域 × 项目分级 — 金额（万元）",
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        except ImportError:
+            pass
+    else:
+        st.warning("缺少「项目分级」或「所属区域」列。")
+
+    st.markdown("### 4）按分类 × 四大区域的园区情况")
+    if "项目分类" in sub.columns and "所属区域" in sub.columns:
+        cat_reg = (
+            sub[sub["所属区域"].isin(四大区域)]
+            .groupby(["所属区域", "项目分类"], dropna=False)
+            .agg(项目数=("序号", "count"), 金额万元=("拟定金额", "sum"))
+            .reset_index()
+        )
+        cr = cat_reg.sort_values(["所属区域", "项目分类"])
+        st.dataframe(cr, use_container_width=True, hide_index=True)
+        try:
+            import plotly.express as px
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                fig_ca = px.bar(
+                    cr,
+                    x="所属区域",
+                    y="金额万元",
+                    color="项目分类",
+                    title="四大区域 × 项目分类 — 金额（万元，堆叠）",
+                    color_discrete_sequence=CHART_COLORS_PIE,
+                )
+                fig_ca.update_layout(
+                    barmode="stack",
+                    height=420,
+                    legend=dict(title="项目分类", orientation="v", yanchor="top", y=1, font=dict(size=10)),
+                    margin=dict(t=48, b=48),
+                )
+                fig_ca.update_xaxes(tickangle=0)
+                st.plotly_chart(fig_ca, use_container_width=True, config={"displayModeBar": False})
+            with col_b:
+                fig_cn = px.bar(
+                    cr,
+                    x="所属区域",
+                    y="项目数",
+                    color="项目分类",
+                    title="四大区域 × 项目分类 — 项目数（堆叠）",
+                    color_discrete_sequence=CHART_COLORS_PIE,
+                )
+                fig_cn.update_layout(
+                    barmode="stack",
+                    height=420,
+                    legend=dict(title="项目分类", orientation="v", yanchor="top", y=1, font=dict(size=10)),
+                    margin=dict(t=48, b=48),
+                )
+                fig_cn.update_xaxes(tickangle=0)
+                st.plotly_chart(fig_cn, use_container_width=True, config={"displayModeBar": False})
+        except ImportError:
+            pass
+    else:
+        st.warning("缺少「项目分类」或「所属区域」列。")
+
+    st.markdown("### 5）每周各园区 — 改良改造「方案」执行情况（按规划设计方案填表周）")
+    scheme_col = "规划设计方案" if "规划设计方案" in sub.columns else None
+    if scheme_col:
+        s2 = sub.copy()
+        s2["_方案日期"] = _parse_timeline_dates(s2[scheme_col])
+        ok = s2[s2["_方案日期"].notna()]
+        if not ok.empty:
+            ok = ok.copy()
+            ok["年周"] = ok["_方案日期"].dt.strftime("%G-W%V")
+            wk = (
+                ok.groupby(["园区", "年周"], dropna=False)
+                .agg(方案已填项数=("序号", "count"), 金额万元=("拟定金额", "sum"))
+                .reset_index()
+                .sort_values(["年周", "园区"])
+            )
+            st.dataframe(wk, use_container_width=True, hide_index=True)
+        else:
+            st.info("「规划设计方案」列暂无有效日期，请在线上编辑中补录节点日期。")
+    else:
+        st.warning("未找到「规划设计方案」列。")
+
+    st.markdown("### 6）每月四大区域 — 改良改造执行情况（按「实施」日期汇总）")
+    impl_col = None
+    for col in sub.columns:
+        c = str(col).strip()
+        if "实施" in c and "时间" not in c.lower():
+            impl_col = col
+            break
+    if impl_col and "所属区域" in sub.columns:
+        s3 = sub.copy()
+        s3["_实施日期"] = _parse_timeline_dates(s3[impl_col])
+        mreg = s3[s3["_实施日期"].notna() & s3["所属区域"].isin(四大区域)].copy()
+        if not mreg.empty:
+            mreg["年月"] = mreg["_实施日期"].dt.to_period("M").astype(str)
+            mon_r = (
+                mreg.groupby(["年月", "所属区域"], dropna=False)
+                .agg(实施项数=("序号", "count"), 金额万元=("拟定金额", "sum"))
+                .reset_index()
+                .sort_values(["年月", "所属区域"])
+            )
+            st.dataframe(mon_r, use_container_width=True, hide_index=True)
+            try:
+                from plotly.subplots import make_subplots
+                import plotly.graph_objects as go
+
+                regions_ord = sorted(mon_r["所属区域"].unique().tolist())
+                fig2 = make_subplots(specs=[[{"secondary_y": True}]])
+                for i, reg in enumerate(regions_ord):
+                    d = mon_r[mon_r["所属区域"] == reg].sort_values("年月")
+                    color = CHART_COLORS_PIE[i % len(CHART_COLORS_PIE)]
+                    fig2.add_trace(
+                        go.Bar(
+                            x=d["年月"],
+                            y=d["金额万元"],
+                            name=f"{reg}·金额（万元）",
+                            marker_color=color,
+                            legendgroup=reg,
+                        ),
+                        secondary_y=False,
+                    )
+                    fig2.add_trace(
+                        go.Scatter(
+                            x=d["年月"],
+                            y=d["实施项数"],
+                            name=f"{reg}·实施项数",
+                            mode="lines+markers",
+                            line=dict(color=color, width=2.5, dash="dot"),
+                            marker=dict(size=9, color=color, symbol="diamond"),
+                            legendgroup=reg,
+                        ),
+                        secondary_y=True,
+                    )
+                fig2.update_layout(
+                    title="每月 × 四大区域 — 实施金额（万元，柱）与实施项数（折线）",
+                    barmode="group",
+                    height=460,
+                    legend=dict(orientation="v", yanchor="top", y=1, x=1.02, font=dict(size=10)),
+                    margin=dict(r=120, t=48, b=80),
+                )
+                fig2.update_xaxes(tickangle=-45)
+                fig2.update_yaxes(title_text="金额（万元）", secondary_y=False)
+                fig2.update_yaxes(title_text="实施项数", secondary_y=True, rangemode="tozero")
+                st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            except ImportError:
+                pass
+        else:
+            st.info("「实施」列暂无有效日期，无法按月×区域统计。")
+    else:
+        st.warning("需要「实施」类进度列与「所属区域」。")
+
+    st.markdown("### 7）改造方案与施工「卡点」（招采已完成而实施未启动）")
+    if "招采" in sub.columns and impl_col:
+        s5 = sub.copy()
+        s5["_招采日期"] = _parse_timeline_dates(s5["招采"])
+        s5["_实施日期"] = _parse_timeline_dates(s5[impl_col])
+        stuck = s5[s5["_招采日期"].notna() & s5["_实施日期"].isna()]
+        st.metric("招采已填日期但未实施", len(stuck))
+        if not stuck.empty:
+            cols8 = [c for c in ["园区", "序号", "项目名称", "拟定金额", "招采", impl_col, "备注说明"] if c in stuck.columns]
+            st.dataframe(stuck[cols8], use_container_width=True, hide_index=True)
+        remark_stuck = sub[
+            sub["备注说明"].astype(str).str.contains("卡|停滞|待协调|无法进场|招采", na=False, regex=True)
+        ] if "备注说明" in sub.columns else pd.DataFrame()
+        if not remark_stuck.empty:
+            st.markdown("**备注中含「卡/停滞/待协调」等字样的行**")
+            st.dataframe(
+                remark_stuck[
+                    [c for c in ["园区", "序号", "项目名称", "备注说明", "拟定金额"] if c in remark_stuck.columns]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.info("需要同时存在「招采」与「实施」列以自动识别卡点。")
+
+    st.markdown("### 8）月度汇总与预算执行、预警园区（未按期/低确定率）")
+    st.markdown("##### 8.1 整体：金额与预算")
+    st.write(
+        f"- 筛选范围金额 **{total_amount:,.0f}** 万元；"
+        f"预算系统合计 **{budget_total:,.0f}** 万元（若已识别）。"
+    )
+    立项_col = None
+    for col in sub.columns:
+        cs = str(col).strip()
+        if any(k in cs for k in ["需求立项", "项目立项", "立项日期", "立项"]) and "审核" not in cs and "决策" not in cs:
+            立项_col = col
+            break
+    if 立项_col:
+        s6 = sub.copy()
+        s6[立项_col] = s6[立项_col].replace("", pd.NA)
+        idx = s6.sort_values(["园区", "序号"]).index
+        s6.loc[idx, 立项_col] = s6.loc[idx].groupby("园区", sort=False)[立项_col].ffill()
+        s6["_立项_p"] = _parse_timeline_dates(s6[立项_col])
+        s6["已立项"] = s6["_立项_p"].notna()
+        undet = s6[~s6["已立项"]]
+        st.metric("未立项（无有效立项日期）条数", len(undet))
+        st.metric("未立项金额合计（万元）", f"{undet['拟定金额'].sum():,.0f}" if "拟定金额" in undet.columns else "—")
+        det = s6.groupby("园区", dropna=False).agg(
+            总项=("序号", "count"),
+            已立项项=("已立项", "sum"),
+        ).reset_index()
+        det["确定率%"] = (det["已立项项"] / det["总项"] * 100).round(1)
+        det["未立项项"] = det["总项"] - det["已立项项"]
+        warn = det[(det["确定率%"] < 80) & (det["总项"] >= 3)].sort_values("确定率%")
+        if not warn.empty:
+            st.error("**预警：确定率偏低园区（总项≥3 且 确定率<80%）**")
+            try:
+                from plotly.subplots import make_subplots
+                import plotly.graph_objects as go
+
+                w = warn.sort_values("总项", ascending=True)
+                fig_w = make_subplots(specs=[[{"secondary_y": True}]])
+                fig_w.add_trace(
+                    go.Bar(x=w["园区"], y=w["已立项项"], name="已立项项", marker_color="#27ae60"),
+                    secondary_y=False,
+                )
+                fig_w.add_trace(
+                    go.Bar(x=w["园区"], y=w["未立项项"], name="未立项项", marker_color="#e74c3c"),
+                    secondary_y=False,
+                )
+                fig_w.add_trace(
+                    go.Scatter(
+                        x=w["园区"],
+                        y=w["确定率%"],
+                        name="确定率%",
+                        mode="lines+markers",
+                        marker=dict(size=9, color="#2980b9"),
+                        line=dict(color="#2980b9", width=2),
+                    ),
+                    secondary_y=True,
+                )
+                fig_w.update_layout(
+                    barmode="stack",
+                    title="预警园区：已立项 / 未立项 项目数（堆叠）与确定率曲线",
+                    height=420,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(t=56, b=80),
+                )
+                fig_w.update_yaxes(title_text="项目数", secondary_y=False)
+                fig_w.update_yaxes(title_text="确定率（%）", range=[0, 105], secondary_y=True)
+                fig_w.update_xaxes(tickangle=-35)
+                st.plotly_chart(fig_w, use_container_width=True, config={"displayModeBar": False})
+            except ImportError:
+                pass
+        else:
+            st.success("未发现「确定率<80% 且项目不少于3个」的园区（可调整阈值）。")
+    else:
+        st.info("未找到立项日期列，跳过确定率预警。")
+
+    if impl_col:
+        s7 = sub.copy()
+        s7["_实施日期"] = _parse_timeline_dates(s7[impl_col])
+        not_impl = s7[s7["_实施日期"].isna()]
+        park_ni = (
+            not_impl.groupby("园区", dropna=False)["拟定金额"].sum().reset_index().rename(columns={"拟定金额": "未实施金额"})
+            if "园区" in not_impl.columns and "拟定金额" in not_impl.columns
+            else pd.DataFrame()
+        )
+        if not park_ni.empty:
+            park_ni = park_ni.sort_values("未实施金额", ascending=False)
+            st.markdown("##### 8.2 未实施金额 Top 园区（预警参考）")
+            top15 = park_ni.head(15).copy()
+            try:
+                import plotly.graph_objects as go
+
+                top15_h = top15.sort_values("未实施金额", ascending=True)
+                fig_n = go.Figure(
+                    go.Bar(
+                        x=top15_h["未实施金额"],
+                        y=top15_h["园区"],
+                        orientation="h",
+                        marker_color="#c0392b",
+                        text=top15_h["未实施金额"].round(0).astype(int),
+                        textposition="outside",
+                        texttemplate="%{text} 万",
+                    )
+                )
+                fig_n.update_layout(
+                    title="未实施金额 Top 园区（万元）",
+                    height=max(320, 28 * len(top15_h) + 80),
+                    xaxis_title="未实施金额（万元）",
+                    yaxis_title="",
+                    margin=dict(l=8, r=80, t=48, b=48),
+                )
+                st.plotly_chart(fig_n, use_container_width=True, config={"displayModeBar": False})
+            except ImportError:
+                pass
+
+
+def _add_城市和区域列(df: pd.DataFrame) -> pd.DataFrame:
+    """为 df 同时增加「城市」和「所属区域」列，不修改原表。"""
+    out = df.copy()
+    out["城市"] = out["园区"].map(园区_TO_城市).fillna("其他")
+    out["所属区域"] = out["园区"].map(园区_TO_区域).fillna("其他")
+    return out
+
+
+def _compute_园区施工安全摘要(df: pd.DataFrame) -> dict:
+    """
+    按「项目名称/备注」关键词识别施工安全关注（与要点看板口径一致）。
+    返回 园区 -> { 安全关注条数, 安全提示_html }，供地图悬浮层使用。
+    """
+    kw_groups = [
+        ("高空作业", ["高空", "登高", "脚手架", "吊篮"]),
+        ("动火作业", ["动火", "焊接", "切割", "明火"]),
+        ("受限空间", ["受限空间", "密闭", "有限空间", "管道井", "吊顶内"]),
+        ("噪音", ["噪音", "噪声", "凿除", "拆除"]),
+        ("油漆/气味", ["油漆", "涂料", "喷漆", "环氧", "气味", "挥发性"]),
+    ]
+    text_cols = [c for c in ("项目名称", "备注说明") if c in df.columns]
+    if not text_cols or df.empty or "园区" not in df.columns:
+        return {}
+
+    def _row_tags(blob: str) -> list:
+        tags = []
+        for name, kws in kw_groups:
+            if any(k in blob for k in kws):
+                tags.append(name)
+        return tags
+
+    sub = df.copy()
+    if "序号" in sub.columns:
+        sub = sub[sub["序号"].notna()]
+        sub = sub[~sub["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
+        sub = sub[pd.to_numeric(sub["序号"], errors="coerce").notna()]
+
+    out = {}
+    for park, g in sub.groupby("园区", dropna=False):
+        pk = str(park).strip()
+        if not pk or pk.lower() == "nan":
+            continue
+        tag_agg = {}
+        risky_rows = []
+        for _, row in g.iterrows():
+            blob = " ".join(str(row[c]) for c in text_cols if pd.notna(row[c]))
+            tags = _row_tags(blob)
+            if not tags:
+                continue
+            for t in tags:
+                tag_agg[t] = tag_agg.get(t, 0) + 1
+            pname = html_module.escape(str(row.get("项目名称", ""))[:48])
+            risky_rows.append((pname, tags))
+
+        n_risk = len(risky_rows)
+        lines = []
+        if tag_agg:
+            summary = "、".join(f"{k}×{v}" for k, v in sorted(tag_agg.items(), key=lambda x: (-x[1], x[0]))[:8])
+            lines.append(f'<span style="color:#333;">{summary}</span>')
+        else:
+            lines.append('<span style="color:#888;">无关键词命中</span>')
+        for pname, tags in risky_rows[:4]:
+            lines.append(
+                f'<div style="font-size:11px;margin-top:2px;">· {pname}…({html_module.escape("、".join(tags))})</div>'
+            )
+        if n_risk > 4:
+            lines.append(f'<div style="font-size:11px;color:#666;">… 等共 {n_risk} 条</div>')
+        out[pk] = {
+            "安全关注条数": n_risk,
+            "安全提示_html": "<br/>".join(lines),
+        }
+    return out
+
+
+def _build_park_map_悬浮(df: pd.DataFrame, safety_by_park: dict) -> dict:
+    """园区 -> { 项目数, 预算万元, 安全关注条数, 安全提示_html }，仅含在地图上能落点的园区。"""
+    out = {}
+    for park in df["园区"].dropna().unique():
+        pk = str(park).strip()
+        if not pk or pk not in 园区_TO_城市:
+            continue
+        if 园区_TO_城市[pk] not in 城市_COORDS:
+            continue
+        g = df[df["园区"] == park]
+        pc = len(g)
+        pa = float(g["拟定金额"].sum()) if "拟定金额" in g.columns else 0.0
+        s = safety_by_park.get(pk, {})
+        out[pk] = {
+            "项目数": int(pc),
+            "预算万元": int(round(pa)),
+            "安全关注条数": int(s.get("安全关注条数", 0)),
+            "安全提示_html": s.get("安全提示_html", '<span style="color:#888">无关键词命中</span>'),
+        }
+    return out
+
+
+def _build_城市_园区明细(df: pd.DataFrame, safety_by_park: dict | None = None) -> dict:
+    """按城市汇总，每个城市下为各园区的：园区名称、项目总数、总预算；可选安全命中条数。供地图 tooltip 使用。"""
+    sub = df[df["城市"].notna() & (df["城市"] != "其他")]
+    if sub.empty:
+        return {}
+    by_city_park = sub.groupby(["城市", "园区"], dropna=False).agg(
+        项目数=("序号", "count"),
+        金额合计=("拟定金额", "sum"),
+    ).reset_index()
+    out = {}
+    for city in by_city_park["城市"].unique():
+        rows = by_city_park[by_city_park["城市"] == city]
+        parks = []
+        total_n = 0
+        total_a = 0
+        for _, r in rows.iterrows():
+            n = int(r["项目数"])
+            a = int(r["金额合计"])
+            pname = str(r["园区"])
+            item = {"园区名称": pname, "项目数": n, "预算万元": int(round(a))}
+            if safety_by_park and pname in safety_by_park:
+                item["安全关注条数"] = int(safety_by_park[pname].get("安全关注条数", 0))
+            else:
+                item["安全关注条数"] = 0
+            parks.append(item)
+            total_n += n
+            total_a += a
+        out[str(city)] = {"项目总数": total_n, "总预算万元": int(round(total_a)), "园区列表": parks}
+    return out
+
+
+def _render_中国地图(df: pd.DataFrame, city_tooltip_data: dict, park_map_info: dict | None = None):
+    """中国地图：悬浮显示城市下各园区详情；园区散点悬浮显示施工安全关注；点击城市后通过 URL 参数筛选并跳转下方详情。"""
+    try:
+        from pyecharts.charts import Geo
+        from pyecharts import options as opts
+        from pyecharts.commons.utils import JsCode
+    except ImportError:
+        st.warning("请安装 pyecharts：pip install pyecharts")
+        st.info("如果已安装，请尝试：pip install pyecharts -U")
+        st.info("地图显示还需要安装地图数据包：pip install echarts-china-provinces-pypkg echarts-china-cities-pypkg")
+        return
+    
+    # 检查数据是否为空
+    if df.empty:
+        st.warning("数据为空，无法显示地图。")
+        return
+    
+    # 检查是否有城市列
+    if "城市" not in df.columns:
+        st.warning("数据中缺少'城市'列，无法显示地图。")
+        return
+    
+    by_city = df.groupby("城市", dropna=False).agg(
+        项目数=("序号", "count"),
+        金额合计=("拟定金额", "sum"),
+    ).reset_index()
+    
+    data = []
+    for _, row in by_city.iterrows():
+        city = row["城市"]
+        if city in 城市_COORDS and city != "其他":
+            data.append((city, int(row["项目数"])))
+    
+    if not data:
+        st.info("当前数据中暂无已配置区位的城市，或请先在侧边栏选择园区。")
+        st.info(f"数据中的城市列表：{by_city['城市'].unique().tolist()}")
+        st.info(f"已配置区位的城市：{list(城市_COORDS.keys())[:10]}...")
+        return
+    
+    # 准备园区地点数据：收集所有园区的位置信息（在创建图表之前）
+    park_locations = []
+    for park in df["园区"].dropna().unique():
+        if park in 园区_TO_城市:
+            city = 园区_TO_城市[park]
+            if city in 城市_COORDS:
+                lon, lat = 城市_COORDS[city]
+                # 统计该园区的项目数
+                park_count = len(df[df["园区"] == park])
+                park_locations.append((park, lon, lat, park_count))
+    
+    # 悬浮：① 园区散点 → PARK_MAP_INFO（施工安全）；② 城市圆点 → MAP_TOOLTIP_DATA（各园区+安全条数）
+    tooltip_js = JsCode(
+        """
+        function(params) {
+            var name = params.name;
+            var value = params.value;
+            var n = (value && value[2]) != null ? value[2] : (value || 0);
+            if (typeof window.PARK_MAP_INFO !== 'undefined' && window.PARK_MAP_INFO[name]) {
+                var pi = window.PARK_MAP_INFO[name];
+                var s = '<div style="text-align:left; min-width:220px; max-width:420px;">';
+                s += '<b>' + name + '</b> · 社区<br/>';
+                s += '项目数：' + (pi['项目数']||0) + ' 项｜预算：' + (pi['预算万元']||0) + ' 万元<br/>';
+                s += '<hr style="margin:6px 0;"/>';
+                s += '<span style="color:#c0392b;font-weight:bold;">施工安全关注</span>';
+                s += '<span style="color:#666;font-size:11px;">（高空/动火/受限空间/噪音/油漆等关键词）</span><br/>';
+                s += '命中条数：<b>' + (pi['安全关注条数']||0) + '</b><br/>';
+                s += (pi['安全提示_html'] || '');
+                s += '</div>';
+                return s;
+            }
+            var info = typeof window.MAP_TOOLTIP_DATA !== 'undefined' && window.MAP_TOOLTIP_DATA[name];
+            if (info) {
+                var s = '<div style="text-align:left; min-width:200px; max-width:380px;">';
+                s += '<b>' + name + '</b>（城市）<br/>';
+                s += '项目总数：' + (info['项目总数'] || n) + ' 项<br/>';
+                s += '总预算：' + (info['总预算万元'] || 0) + ' 万元<br/>';
+                s += '<hr style="margin:6px 0;"/>';
+                s += '各社区/园区：<br/>';
+                var list = info['园区列表'] || [];
+                for (var i = 0; i < list.length; i++) {
+                    var p = list[i];
+                    s += '· ' + (p['园区名称'] || '') + '｜' + (p['项目数'] || 0) + ' 项｜' + (p['预算万元'] || 0) + ' 万';
+                    var sn = p['安全关注条数'];
+                    if (sn != null && sn > 0) {
+                        s += '｜<span style="color:#c0392b;">安全' + sn + '条</span>';
+                    }
+                    s += '<br/>';
+                }
+                s += '</div>';
+                return s;
+            }
+            return name + '<br/>项目数：' + n + ' 项';
+        }
+        """
+    )
+    
+    # 使用Geo图表（支持同时显示地图和园区位置散点）
+    geo = Geo(init_opts=opts.InitOpts(width="100%", height="500px", theme="light", renderer="canvas"))
+    geo.add_schema(maptype="china", is_roam=True)
+    # 添加所有城市坐标
+    for city, (lon, lat) in 城市_COORDS.items():
+        geo.add_coordinate(city, lon, lat)
+    # 添加城市项目数散点图（使用effectScatter效果更明显）
+    geo.add(
+        "项目数",
+        data,
+        type_="effectScatter",
+        symbol_size=14,
+        effect_opts=opts.EffectOpts(scale=4, brush_type="stroke"),
+        label_opts=opts.LabelOpts(is_show=True, formatter="{b}", font_size=11),
+    )
+    # 添加园区地点标记（红色散点）
+    if park_locations:
+        # 为每个园区添加坐标
+        for park_name, lon, lat, park_count in park_locations:
+            geo.add_coordinate(park_name, lon, lat)
+        # 添加园区散点图
+        park_data = [(park_name, park_count) for park_name, lon, lat, park_count in park_locations]
+        geo.add(
+            "园区位置",
+            park_data,
+            type_="scatter",
+            symbol_size=10,
+            itemstyle_opts=opts.ItemStyleOpts(color="#ff6b6b"),
+            label_opts=opts.LabelOpts(is_show=True, formatter="{b}", font_size=9, position="right"),
+        )
+    # 设置全局选项
+    geo.set_global_opts(
+        title_opts=opts.TitleOpts(title="各地市项目分布（点击城市可筛选下方详情）", pos_left="center"),
+        tooltip_opts=opts.TooltipOpts(trigger="item", formatter=tooltip_js),
+        visualmap_opts=opts.VisualMapOpts(
+            min_=min(d[1] for d in data),
+            max_=max(d[1] for d in data),
+            is_piecewise=False,
+            pos_left="left",
+            range_color=["#e0f3f8", "#0868ac"],
+        ),
+    )
+    
+    # 如果数据为空，显示备用信息
+    if not data:
+        st.warning("暂无地图数据可显示")
+        # 显示城市列表作为备用
+        if not by_city.empty:
+            st.dataframe(by_city[["城市", "项目数", "金额合计"]], use_container_width=True, hide_index=True)
+        return
+    
+    # 尝试使用pyecharts
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".html", delete=False, encoding="utf-8") as f:
+            geo.render(f.name)
+            html_path = f.name
+        
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        
+        # 检查HTML是否生成成功
+        if not html or len(html) < 100:
+            st.error("地图HTML生成失败，请检查pyecharts安装是否正确。")
+            st.info("提示：可能需要安装地图数据包：pip install echarts-china-provinces-pypkg echarts-china-cities-pypkg")
+            # 显示备用表格
+            if not by_city.empty:
+                st.dataframe(by_city[["城市", "项目数", "金额合计"]], use_container_width=True, hide_index=True)
+            return
+        
+        # 检查HTML中是否包含echarts相关代码
+        if "echarts" not in html.lower() and "echart" not in html.lower():
+            st.warning("生成的HTML中未找到echarts相关代码，地图可能无法正常显示。")
+            st.info("提示：可能需要安装地图数据包：pip install echarts-china-provinces-pypkg echarts-china-cities-pypkg")
+            if not by_city.empty:
+                st.dataframe(by_city[["城市", "项目数", "金额合计"]], use_container_width=True, hide_index=True)
+            return
+        
+        # 注入 tooltip 数据与点击跳转：悬浮用 MAP_TOOLTIP_DATA，点击后带 ?selected_city= 刷新并定位下方
+        import json
+        tooltip_json = json.dumps(city_tooltip_data, ensure_ascii=False)
+        park_json = json.dumps(park_map_info or {}, ensure_ascii=False)
+        inject = (
+            "<script>\n"
+            "window.MAP_TOOLTIP_DATA = " + tooltip_json + ";\n"
+            "window.PARK_MAP_INFO = " + park_json + ";\n"
+            "function attachMapClick() {\n"
+            "  var dom = document.querySelector('[id^=\"_\"]');\n"
+            "  if (dom && window.echarts) {\n"
+            "    var inst = window.echarts.getInstanceByDom(dom);\n"
+            "    if (inst && !inst._mapClickAttached) {\n"
+            "      inst._mapClickAttached = true;\n"
+            "      inst.on('click', function(params) {\n"
+            "        if (params && params.name) {\n"
+            "          var u = window.top.location.pathname || '/';\n"
+            "          var q = 'selected_city=' + encodeURIComponent(params.name);\n"
+            "          window.top.location.href = u + (u.indexOf('?')>=0 ? '&' : '?') + q;\n"
+            "        }\n"
+            "      });\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "if (document.readyState === 'complete') { setTimeout(attachMapClick, 300); }\n"
+            "else { document.addEventListener('DOMContentLoaded', function() { setTimeout(attachMapClick, 300); }); }\n"
+            "</script>\n"
+        )
+        # pyecharts 渲染的图表在 div 内，在 body 末尾插入 script
+        if "</body>" in html:
+            html = html.replace("</body>", inject + "</body>")
+        else:
+            html = html + inject
+        
+        # 显示地图
+        st.components.v1.html(html, height=450, scrolling=False)
+        
+    except Exception as e:
+        error_msg = str(e)
+        st.error(f"pyecharts地图渲染出错：{error_msg}")
+        st.info("已在上方显示Streamlit原生地图作为备用方案")
+        st.info("如需使用pyecharts地图，请检查：")
+        st.info("1) pyecharts是否正确安装：pip install pyecharts")
+        st.info("2) 是否安装了地图数据包：pip install echarts-china-provinces-pypkg echarts-china-cities-pypkg")
+        st.info("3) 数据是否包含城市信息")
+        
+        # 显示详细错误信息（仅在开发模式下）
+        if st.checkbox("显示详细错误信息（调试用）", value=False):
+            import traceback
+            st.code(traceback.format_exc())
+        
+        # 显示数据表格作为备用
+        if not by_city.empty:
+            st.markdown("### 城市项目统计（表格视图）")
+            st.dataframe(by_city[["城市", "项目数", "金额合计"]].sort_values("项目数", ascending=False), 
+                        use_container_width=True, hide_index=True)
+    finally:
+        try:
+            if 'html_path' in locals():
+                Path(html_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _render_图表_简易(sub: pd.DataFrame):
+    """无 plotly 时的简易柱状图回退。"""
+    c1, c2 = st.columns(2)
+    with c1:
+        by_prof = sub.groupby("专业", dropna=False).agg(项目数=("序号", "count")).reset_index().sort_values("项目数", ascending=False)
+        if not by_prof.empty:
+            st.bar_chart(by_prof.set_index("专业")["项目数"])
+    with c2:
+        by_level = sub.groupby("项目分级", dropna=False).agg(项目数=("序号", "count")).reset_index().sort_values("项目数", ascending=False)
+        if not by_level.empty:
+            st.bar_chart(by_level.set_index("项目分级")["项目数"])
+    by_park = sub.groupby("园区", dropna=False).agg(项目数=("序号", "count")).reset_index().sort_values("项目数", ascending=False).head(20)
+    if not by_park.empty:
+        st.bar_chart(by_park.set_index("园区")["项目数"])
+    by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("拟定金额", "sum")).reset_index().sort_values("金额", ascending=False)
+    if not by_prof_m.empty:
+        st.bar_chart(by_prof_m.set_index("专业")["金额"])
+
+
+def generate_interactive_html(df: pd.DataFrame, 园区选择: list) -> str:
+    """生成完全交互式的HTML文件，包含所有数据和交互功能，效果与运行程序一致"""
+    import json
+    
+    # 准备数据：将DataFrame转换为JSON格式
+    # 过滤汇总行
+    df_clean = df.copy()
+    if "序号" in df_clean.columns:
+        df_clean = df_clean[df_clean["序号"].notna()]
+        df_clean = df_clean[~df_clean["序号"].astype(str).str.strip().isin(["合计", "预算系统合计", "差", "差额", "小计"])]
+        df_clean = df_clean[pd.to_numeric(df_clean["序号"], errors='coerce').notna()]
+    
+    # 添加城市和区域列
+    df_with_location = _add_城市和区域列(df_clean)
+    
+    # 转换为JSON（处理NaN值）
+    def convert_to_json_serializable(obj):
+        if pd.isna(obj):
+            return None
+        if isinstance(obj, (pd.Timestamp, datetime)):
+            return obj.strftime('%Y-%m-%d')
+        if isinstance(obj, (int, float)):
+            return float(obj) if not pd.isna(obj) else None
+        return str(obj)
+    
+    data_records = []
+    for _, row in df_with_location.iterrows():
+        record = {}
+        for col in df_with_location.columns:
+            val = row[col]
+            record[col] = convert_to_json_serializable(val)
+        data_records.append(record)
+    
+    # 获取所有园区列表
+    parks_list = sorted([p for p in df_with_location["园区"].dropna().unique().tolist() 
+                        if p and str(p).strip() and str(p) != "未知园区"])
+    
+    # 默认选中的园区
+    default_parks = 园区选择 if 园区选择 and len(园区选择) > 0 else parks_list
+    
+    # 序列化JSON数据
+    # 将JSON对象序列化为字符串，然后再次转义以便在JavaScript中作为字符串字面量使用
+    data_json_raw = json.dumps(data_records, ensure_ascii=False)
+    parks_json_raw = json.dumps(parks_list, ensure_ascii=False)
+    
+    # 将JSON字符串转换为JavaScript字符串字面量（转义引号、反斜杠等特殊字符）
+    # 使用json.dumps再次转义，确保在JavaScript中可以安全使用
+    data_json = json.dumps(data_json_raw)
+    parks_json = json.dumps(parks_json_raw)
+    
+    # 生成HTML
+    html_content = f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>养老社区改良改造进度管理看板</title>
+    <script src="https://cdn.plot.ly/plotly-2.26.0.min.js"></script>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            font-family: "Microsoft YaHei", "SimSun", "SimHei", Arial, sans-serif;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: white;
+            min-height: 100vh;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #1f4788 0%, #4a7bc8 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .header h1 {{
+            font-size: 28px;
+            margin-bottom: 10px;
+        }}
+        .header .caption {{
+            font-size: 14px;
+            opacity: 0.9;
+        }}
+        .sidebar {{
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid #e0e0e0;
+        }}
+        .sidebar h3 {{
+            color: #1f4788;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }}
+        .multiselect {{
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            background-color: white;
+            max-height: 200px;
+            overflow-y: auto;
+        }}
+        .multiselect option {{
+            padding: 5px;
+        }}
+        .multiselect option:checked {{
+            background-color: #4a7bc8;
+            color: white;
+        }}
+        .tabs {{
+            display: flex;
+            border-bottom: 2px solid #e0e0e0;
+            margin-bottom: 20px;
+            overflow-x: auto;
+        }}
+        .tab-button {{
+            padding: 12px 24px;
+            background-color: #f8f9fa;
+            border: none;
+            border-bottom: 3px solid transparent;
+            cursor: pointer;
+            font-size: 15px;
+            color: #666;
+            transition: all 0.3s;
+            white-space: nowrap;
+        }}
+        .tab-button:hover {{
+            background-color: #e9ecef;
+            color: #1f4788;
+        }}
+        .tab-button.active {{
+            background-color: white;
+            color: #1f4788;
+            border-bottom-color: #4a7bc8;
+            font-weight: bold;
+        }}
+        .tab-content {{
+            display: none;
+            padding: 20px 0;
+        }}
+        .tab-content.active {{
+            display: block;
+        }}
+        .section {{
+            margin-bottom: 30px;
+        }}
+        .section h2 {{
+            font-size: 22px;
+            color: #1f4788;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #4a7bc8;
+        }}
+        .section h3 {{
+            font-size: 18px;
+            color: #2c5aa0;
+            margin: 20px 0 10px 0;
+        }}
+        .section h4 {{
+            font-size: 16px;
+            color: #4a7bc8;
+            margin: 15px 0 8px 0;
+        }}
+        .metrics {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }}
+        .metric {{
+            background: linear-gradient(135deg, #f0f8ff 0%, #e6f3ff 100%);
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #4a7bc8;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .metric-label {{
+            font-size: 13px;
+            color: #666;
+            margin-bottom: 8px;
+        }}
+        .metric-value {{
+            font-size: 24px;
+            font-weight: bold;
+            color: #1f4788;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+            font-size: 13px;
+            background-color: white;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        th {{
+            background-color: #4a7bc8;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: bold;
+            position: sticky;
+            top: 0;
+        }}
+        td {{
+            padding: 10px 12px;
+            border-bottom: 1px solid #e0e0e0;
+        }}
+        tr:hover {{
+            background-color: #f5f5f5;
+        }}
+        tr:nth-child(even) {{
+            background-color: #fafafa;
+        }}
+        .chart-container {{
+            margin: 20px 0;
+            background-color: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .info-box {{
+            background-color: #e7f3ff;
+            border-left: 4px solid #4a7bc8;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }}
+        .warning-box {{
+            background-color: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }}
+        .expander {{
+            margin: 10px 0;
+        }}
+        .expander-header {{
+            background-color: #f8f9fa;
+            padding: 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            border: 1px solid #e0e0e0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .expander-header:hover {{
+            background-color: #e9ecef;
+        }}
+        .expander-content {{
+            display: none;
+            padding: 15px;
+            border: 1px solid #e0e0e0;
+            border-top: none;
+            border-radius: 0 0 4px 4px;
+        }}
+        .expander-content.active {{
+            display: block;
+        }}
+        .expander-icon {{
+            transition: transform 0.3s;
+        }}
+        .expander-header.active .expander-icon {{
+            transform: rotate(90deg);
+        }}
+        ul {{
+            padding-left: 25px;
+            margin: 10px 0;
+        }}
+        li {{
+            margin: 8px 0;
+        }}
+        .data-table-container {{
+            overflow-x: auto;
+            margin: 15px 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏠 养老社区改良改造进度管理看板</h1>
+            <div class="caption">需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收</div>
+        </div>
+        
+        <div class="sidebar">
+            <h3>📊 数据筛选</h3>
+            <label for="park-select" style="display: block; margin-bottom: 8px; font-weight: bold;">筛选园区：</label>
+            <select id="park-select" class="multiselect" multiple size="8">
+                {''.join([f'<option value="{p}" {"selected" if p in default_parks else ""}>{p}</option>' for p in parks_list])}
+            </select>
+            <div style="margin-top: 10px; font-size: 12px; color: #666;">
+                💡 提示：按住 Ctrl (Windows) 或 Cmd (Mac) 键可多选
+            </div>
+            
+            <div style="margin-top: 20px;">
+                <div class="expander">
+                    <div class="expander-header" onclick="toggleExpander(this)">
+                        <span><strong>📋 需求审核与实施流程说明</strong></span>
+                        <span class="expander-icon">▶</span>
+                    </div>
+                    <div class="expander-content">
+                        <ul style="margin: 10px 0; padding-left: 20px;">
+                            <li><strong>1. 社区提出：</strong>一线园区提出改造需求。</li>
+                            <li><strong>2. 紧急程度分级：</strong>按一级（最高级）、二级、三级划分。</li>
+                            <li><strong>3. 专业分类：</strong>按 9 大类专业划分：土建、供配电、暖通/供冷、弱电、供排水、电梯、其它、消防、安防等。</li>
+                            <li><strong>4. 财务预算拆分：</strong>按预算系统进行金额拆分与汇总。</li>
+                            <li><strong>5. 一线立项时间：</strong>一线填写需求并提出立项时间。</li>
+                            <li><strong>6. 项目部施工：</strong>项目部根据已确定的需求立项组织施工。</li>
+                            <li><strong>7. 总部运行保障部：</strong>督促一线需求稳定，协调总部相关部门把控需求，输出给不动产进行招采、施工。</li>
+                            <li><strong>8. 施工验收：</strong>总部运行保障部督促一线园区进行最终施工验收。</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="tabs">
+            <button class="tab-button active" onclick="switchTab(0)">项目统计分析</button>
+            <button class="tab-button" onclick="switchTab(1)">统计</button>
+            <button class="tab-button" onclick="switchTab(2)">地区分析</button>
+            <button class="tab-button" onclick="switchTab(3)">各园区分级分类</button>
+            <button class="tab-button" onclick="switchTab(4)">总部视图</button>
+            <button class="tab-button" onclick="switchTab(5)">全部项目</button>
+        </div>
+        
+        <div id="tab-0" class="tab-content active"></div>
+        <div id="tab-1" class="tab-content"></div>
+        <div id="tab-2" class="tab-content"></div>
+        <div id="tab-3" class="tab-content"></div>
+        <div id="tab-4" class="tab-content"></div>
+        <div id="tab-5" class="tab-content"></div>
+    </div>
+    
+    <script>
+        // 数据存储
+        const allData = JSON.parse({data_json});
+        const parksList = JSON.parse({parks_json});
+        let filteredData = [...allData];
+        let currentTab = 0;
+        
+        // 园区筛选
+        document.getElementById('park-select').addEventListener('change', function() {{
+            const selectedParks = Array.from(this.selectedOptions).map(opt => opt.value);
+            if (selectedParks.length === 0) {{
+                filteredData = allData.filter(d => d.园区 && d.园区 !== null && d.园区 !== '');
+            }} else {{
+                filteredData = allData.filter(d => selectedParks.includes(d.园区));
+            }}
+            renderAllTabs();
+        }});
+        
+        // 标签页切换
+        function switchTab(index) {{
+            currentTab = index;
+            document.querySelectorAll('.tab-button').forEach((btn, i) => {{
+                btn.classList.toggle('active', i === index);
+            }});
+            document.querySelectorAll('.tab-content').forEach((content, i) => {{
+                content.classList.toggle('active', i === index);
+            }});
+        }}
+        
+        // 工具函数
+        function formatNumber(num) {{
+            if (num === null || num === undefined || isNaN(num)) return '0';
+            return parseFloat(num).toLocaleString('zh-CN', {{maximumFractionDigits: 2}});
+        }}
+        
+        function formatCurrency(num) {{
+            if (num === null || num === undefined || isNaN(num)) return '0';
+            return parseFloat(num).toLocaleString('zh-CN', {{maximumFractionDigits: 0}});
+        }}
+        
+        function getValue(row, col) {{
+            return row[col] !== null && row[col] !== undefined ? row[col] : '';
+        }}
+        
+        function isValidNumber(val) {{
+            return val !== null && val !== undefined && !isNaN(val) && val !== '';
+        }}
+        
+        // 过滤有效项目（有序号且为数字）
+        function getValidProjects(data) {{
+            return data.filter(d => {{
+                const seq = d.序号;
+                if (!seq || seq === null || seq === '') return false;
+                const seqStr = String(seq).trim();
+                if (['合计', '预算系统合计', '差', '差额', '小计'].includes(seqStr)) return false;
+                return !isNaN(parseFloat(seq));
+            }});
+        }}
+        
+        // 渲染所有标签页
+        function renderAllTabs() {{
+            renderTab0(); // 项目统计分析
+            renderTab1(); // 统计
+            renderTab2(); // 地区分析
+            renderTab3(); // 各园区分级分类
+            renderTab4(); // 总部视图
+            renderTab5(); // 全部项目
+        }}
+        
+        // 日期解析工具函数
+        function parseDate(dateStr) {{
+            if (!dateStr || dateStr === null || dateStr === undefined || dateStr === '') return null;
+            const str = String(dateStr).trim();
+            if (str === '' || str === 'nan' || str === 'None' || str.startsWith('1900')) return null;
+            
+            // 尝试解析为日期
+            const date = new Date(str);
+            if (!isNaN(date.getTime()) && date.getFullYear() >= 2000) {{
+                return date;
+            }}
+            
+            // 尝试解析Excel日期序列号
+            const num = parseFloat(str);
+            if (!isNaN(num) && num >= 1 && num <= 100000) {{
+                const excelDate = new Date(1899, 11, 30);
+                excelDate.setDate(excelDate.getDate() + num);
+                if (excelDate.getFullYear() >= 2000) {{
+                    return excelDate;
+                }}
+            }}
+            
+            return null;
+        }}
+        
+        // 稳定需求判断：需求已立项（需求立项日期有效）且非无效日期
+        function isStableRequirement(d) {{
+            // 查找需求立项列
+            let 立项Col = null;
+            for (let key in d) {{
+                if (key.includes('需求立项')) {{
+                    立项Col = key;
+                    break;
+                }}
+            }}
+            if (!立项Col) return false;
+            
+            const date = parseDate(d[立项Col]);
+            return date !== null && date.getFullYear() >= 2000;
+        }}
+        
+        // 标签页0: 项目统计分析
+        function renderTab0() {{
+            const validData = getValidProjects(filteredData);
+            const container = document.getElementById('tab-0');
+            
+            if (validData.length === 0) {{
+                container.innerHTML = '<div class="warning-box">当前筛选条件下暂无数据。</div>';
+                return;
+            }}
+            
+            // 计算统计数据
+            const totalCount = validData.length;
+            const totalAmount = validData.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0);
+            
+            // 尝试提取预算系统合计（从原始数据中查找汇总行）
+            let budgetTotal = 0;
+            const allDataForBudget = getValidProjects(allData);
+            for (let d of allDataForBudget) {{
+                const seq = String(d.序号 || '').trim();
+                if (seq === '预算系统合计' || seq === '合计') {{
+                    const amt = parseFloat(d.拟定金额) || parseFloat(d.金额) || parseFloat(d.预算) || 0;
+                    if (amt > 0) {{
+                        budgetTotal = amt;
+                        break;
+                    }}
+                }}
+            }}
+            const diff = totalAmount - budgetTotal;
+            
+            // 按园区统计
+            const parkStats = {{}};
+            validData.forEach(d => {{
+                const park = d.园区 || '未知';
+                if (!parkStats[park]) {{
+                    parkStats[park] = {{count: 0, amount: 0}};
+                }}
+                parkStats[park].count++;
+                parkStats[park].amount += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 按所属区域统计
+            const regionStats = {{}};
+            validData.forEach(d => {{
+                const region = d.所属区域 || '其他';
+                if (region !== '其他') {{
+                    if (!regionStats[region]) {{
+                        regionStats[region] = {{count: 0, amount: 0, parks: new Set()}};
+                    }}
+                    regionStats[region].count++;
+                    regionStats[region].amount += parseFloat(d.拟定金额) || 0;
+                    if (d.园区) regionStats[region].parks.add(d.园区);
+                }}
+            }});
+            
+            // 按项目分级统计
+            const levelStats = {{}};
+            validData.forEach(d => {{
+                const level = d.项目分级 || '未分类';
+                if (!levelStats[level]) {{
+                    levelStats[level] = {{count: 0, amount: 0}};
+                }}
+                levelStats[level].count++;
+                levelStats[level].amount += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 映射：一级->一类，二级->二类，三级->三类
+            const levelMapping = {{'一级': '一类', '二级': '二类', '三级': '三类'}};
+            const levelStatsMapped = {{}};
+            Object.keys(levelStats).forEach(level => {{
+                const mappedLevel = levelMapping[level] || level;
+                if (!levelStatsMapped[mappedLevel]) {{
+                    levelStatsMapped[mappedLevel] = {{count: 0, amount: 0}};
+                }}
+                levelStatsMapped[mappedLevel].count += levelStats[level].count;
+                levelStatsMapped[mappedLevel].amount += levelStats[level].amount;
+            }});
+            
+            // 项目实施状态分析
+            let implCol = null;
+            for (let key in validData[0]) {{
+                if (key.includes('实施') && !key.toLowerCase().includes('时间')) {{
+                    implCol = key;
+                    break;
+                }}
+            }}
+            
+            let 已实施项目 = [];
+            let 未实施项目 = [];
+            let parkImplStats = {{}};
+            
+            if (implCol) {{
+                const now = new Date();
+                validData.forEach(d => {{
+                    const implDate = parseDate(d[implCol]);
+                    const isImplemented = implDate !== null && implDate <= now;
+                    
+                    if (isImplemented) {{
+                        已实施项目.push(d);
+                    }} else {{
+                        未实施项目.push(d);
+                    }}
+                    
+                    const park = d.园区 || '未知';
+                    if (!parkImplStats[park]) {{
+                        parkImplStats[park] = {{total: 0, implemented: 0, amount: 0, implAmount: 0}};
+                    }}
+                    parkImplStats[park].total++;
+                    parkImplStats[park].amount += parseFloat(d.拟定金额) || 0;
+                    if (isImplemented) {{
+                        parkImplStats[park].implemented++;
+                        parkImplStats[park].implAmount += parseFloat(d.拟定金额) || 0;
+                    }}
+                }});
+            }}
+            
+            // 项目确定状态分析（有立项日期）
+            let 立项Col = null;
+            for (let key in validData[0]) {{
+                if ((key.includes('需求立项') || key.includes('项目立项') || key.includes('立项日期') || key.includes('立项')) &&
+                    !key.includes('审核') && !key.includes('决策') && !key.includes('成本')) {{
+                    立项Col = key;
+                    break;
+                }}
+            }}
+            
+            let 确定项目 = [];
+            let 未确定项目 = [];
+            let parkDeterminationStats = {{}};
+            let monthlyStats = {{}};
+            
+            if (立项Col) {{
+                // 按园区分组，向下填充空值（模拟合并单元格）
+                const parkGroups = {{}};
+                validData.forEach(d => {{
+                    const park = d.园区 || '未知';
+                    if (!parkGroups[park]) parkGroups[park] = [];
+                    parkGroups[park].push(d);
+                }});
+                
+                Object.keys(parkGroups).forEach(park => {{
+                    let lastDate = null;
+                    parkGroups[park].forEach(d => {{
+                        const dateVal = d[立项Col];
+                        if (dateVal && dateVal !== null && dateVal !== '') {{
+                            lastDate = dateVal;
+                        }} else if (lastDate) {{
+                            d[立项Col + '_filled'] = lastDate;
+                        }} else {{
+                            d[立项Col + '_filled'] = dateVal;
+                        }}
+                    }});
+                }});
+                
+                validData.forEach(d => {{
+                    const dateVal = d[立项Col + '_filled'] || d[立项Col];
+                    const hasDate = parseDate(dateVal) !== null;
+                    
+                    if (hasDate) {{
+                        确定项目.push(d);
+                        
+                        // 按月统计
+                        const date = parseDate(dateVal);
+                        if (date) {{
+                            const month = date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0');
+                            if (!monthlyStats[month]) {{
+                                monthlyStats[month] = {{count: 0, amount: 0}};
+                            }}
+                            monthlyStats[month].count++;
+                            monthlyStats[month].amount += parseFloat(d.拟定金额) || 0;
+                        }}
+                    }} else {{
+                        未确定项目.push(d);
+                    }}
+                    
+                    const park = d.园区 || '未知';
+                    if (!parkDeterminationStats[park]) {{
+                        parkDeterminationStats[park] = {{total: 0, determined: 0}};
+                    }}
+                    parkDeterminationStats[park].total++;
+                    if (hasDate) parkDeterminationStats[park].determined++;
+                }});
+            }}
+            
+            // 各园区分类项目统计
+            const parkAnalysis = {{}};
+            validData.forEach(d => {{
+                const park = d.园区 || '未知';
+                if (!parkAnalysis[park]) {{
+                    parkAnalysis[park] = {{
+                        total: 0,
+                        level1: 0,
+                        hq: 0,
+                        major: 0,
+                        majorCount: 0
+                    }};
+                }}
+                const amount = parseFloat(d.拟定金额) || 0;
+                parkAnalysis[park].total += amount;
+                
+                // 一级项目识别：支持多种格式（一级、1级、一级项目、1等）
+                const levelStr = String(d.项目分级 || '').trim();
+                let isLevel1 = false;
+                // 字符串匹配：包含"一级"或"1级"
+                if (levelStr && (levelStr.includes('一级') || levelStr.includes('1级'))) {{
+                    isLevel1 = true;
+                }}
+                // 数字匹配：如果是数字1
+                if (!isLevel1) {{
+                    const levelNum = parseFloat(levelStr);
+                    if (!isNaN(levelNum) && levelNum === 1) {{
+                        isLevel1 = true;
+                    }}
+                }}
+                if (isLevel1) {{
+                    parkAnalysis[park].level1 += amount;
+                }}
+                
+                const hqFocus = String(d.总部重点关注项目 || '').trim();
+                if (hqFocus === '是' || hqFocus.toLowerCase() === 'yes') {{
+                    parkAnalysis[park].hq += amount;
+                }}
+                
+                if (amount >= 200) {{
+                    parkAnalysis[park].major += amount;
+                    parkAnalysis[park].majorCount++;
+                }}
+            }});
+            
+            let html = `
+                <div class="section">
+                    <h2>📊 项目数量与费用统计</h2>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-label">项目总数</div>
+                            <div class="metric-value">${{formatNumber(totalCount)}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">总金额（万元）</div>
+                            <div class="metric-value">${{formatCurrency(totalAmount)}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">预算系统合计（万元）</div>
+                            <div class="metric-value">${{budgetTotal > 0 ? formatCurrency(budgetTotal) : '未找到'}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">差值（万元）</div>
+                            <div class="metric-value" style="color: ${{diff !== 0 ? (diff > 0 ? '#d32f2f' : '#388e3c') : '#666'}};">${{formatCurrency(diff)}}</div>
+                        </div>
+                    </div>
+                    
+                    <h3>按园区统计</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>园区</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(parkStats).sort((a, b) => parkStats[b].amount - parkStats[a].amount).map(park => `
+                                    <tr>
+                                        <td>${{park}}</td>
+                                        <td>${{parkStats[park].count}}</td>
+                                        <td>${{formatCurrency(parkStats[park].amount)}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    ${{Object.keys(regionStats).length > 0 ? `
+                    <h3>按所属区域统计</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>所属区域</th><th>项目数</th><th>金额合计（万元）</th><th>园区数</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(regionStats).sort((a, b) => regionStats[b].count - regionStats[a].count).map(region => `
+                                    <tr>
+                                        <td>${{region}}</td>
+                                        <td>${{regionStats[region].count}}</td>
+                                        <td>${{formatCurrency(regionStats[region].amount)}}</td>
+                                        <td>${{regionStats[region].parks.size}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h4>各区域下园区明细</h4>
+                    ${{Object.keys(regionStats).sort((a, b) => regionStats[b].count - regionStats[a].count).map(region => {{
+                        const regionData = validData.filter(d => d.所属区域 === region);
+                        const parkStatsInRegion = {{}};
+                        regionData.forEach(d => {{
+                            const park = d.园区 || '未知';
+                            if (!parkStatsInRegion[park]) {{
+                                parkStatsInRegion[park] = {{count: 0, amount: 0}};
+                            }}
+                            parkStatsInRegion[park].count++;
+                            parkStatsInRegion[park].amount += parseFloat(d.拟定金额) || 0;
+                        }});
+                        return `
+                            <div class="expander">
+                                <div class="expander-header" onclick="toggleExpander(this)">
+                                    <span><strong>${{region}}</strong>（${{Object.keys(parkStatsInRegion).length}}个园区，${{regionStats[region].count}}个项目，${{formatCurrency(regionStats[region].amount)}}万元）</span>
+                                    <span class="expander-icon">▶</span>
+                                </div>
+                                <div class="expander-content">
+                                    <div class="data-table-container">
+                                        <table>
+                                            <thead>
+                                                <tr><th>园区</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                ${{Object.keys(parkStatsInRegion).sort((a, b) => parkStatsInRegion[b].amount - parkStatsInRegion[a].amount).map(park => `
+                                                    <tr>
+                                                        <td>${{park}}</td>
+                                                        <td>${{parkStatsInRegion[park].count}}</td>
+                                                        <td>${{formatCurrency(parkStatsInRegion[park].amount)}}</td>
+                                                    </tr>
+                                                `).join('')}}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }}).join('')}}
+                    ` : ''}}
+                    
+                    <h3>📈 项目分级占比统计</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>项目类别</th><th>项目数</th><th>项目数占比(%)</th><th>金额合计（万元）</th><th>金额占比(%)</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(levelStatsMapped).map(level => {{
+                                    const count = levelStatsMapped[level].count;
+                                    const amount = levelStatsMapped[level].amount;
+                                    const countPercent = totalCount > 0 ? (count / totalCount * 100).toFixed(2) : 0;
+                                    const amountPercent = totalAmount > 0 ? (amount / totalAmount * 100).toFixed(2) : 0;
+                                    return `
+                                        <tr>
+                                            <td>${{level}}</td>
+                                            <td>${{count}}</td>
+                                            <td>${{countPercent}}%</td>
+                                            <td>${{formatCurrency(amount)}}</td>
+                                            <td>${{amountPercent}}%</td>
+                                        </tr>
+                                    `;
+                                }}).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <div class="chart-container">
+                        <div id="chart-level-count"></div>
+                    </div>
+                    <div class="chart-container">
+                        <div id="chart-level-amount"></div>
+                    </div>
+                    
+                    ${{(validData[0] && (validData[0].专业分包 || validData[0].专业细分)) ? `
+                    <h3>📦 按专业分包统计</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>专业分包</th><th>项目数</th><th>项目数占比(%)</th><th>金额合计（万元）</th><th>金额占比(%)</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{(() => {{
+                                    const profSubcontractCol = validData[0].专业分包 ? '专业分包' : '专业细分';
+                                    const profSubcontractStats = {{}};
+                                    validData.forEach(d => {{
+                                        const val = d[profSubcontractCol] || '未分类';
+                                        if (!profSubcontractStats[val]) {{
+                                            profSubcontractStats[val] = {{count: 0, amount: 0}};
+                                        }}
+                                        profSubcontractStats[val].count++;
+                                        profSubcontractStats[val].amount += parseFloat(d.拟定金额) || 0;
+                                    }});
+                                    const totalCount = validData.length;
+                                    const totalAmount = validData.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0);
+                                    return Object.keys(profSubcontractStats).sort((a, b) => profSubcontractStats[b].amount - profSubcontractStats[a].amount).map(key => {{
+                                        const stats = profSubcontractStats[key];
+                                        const countPercent = totalCount > 0 ? (stats.count / totalCount * 100).toFixed(2) : 0;
+                                        const amountPercent = totalAmount > 0 ? (stats.amount / totalAmount * 100).toFixed(2) : 0;
+                                        return `
+                                            <tr>
+                                                <td>${{key || '未分类'}}</td>
+                                                <td>${{stats.count}}</td>
+                                                <td>${{countPercent}}%</td>
+                                                <td>${{formatCurrency(stats.amount)}}</td>
+                                                <td>${{amountPercent}}%</td>
+                                            </tr>
+                                        `;
+                                    }}).join('');
+                                }})()}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <div class="chart-container">
+                        <div id="chart-prof-subcontract-count"></div>
+                    </div>
+                    <div class="chart-container">
+                        <div id="chart-prof-subcontract-amount"></div>
+                    </div>
+                    
+                    <h4>专业与专业分包交叉统计</h4>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>专业</th><th>专业分包</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{(() => {{
+                                    const profSubcontractCol = validData[0].专业分包 ? '专业分包' : '专业细分';
+                                    const crossStats = {{}};
+                                    validData.forEach(d => {{
+                                        const prof = d.专业 || '未分类';
+                                        const subcontract = d[profSubcontractCol] || '未分类';
+                                        // 过滤掉"其它系统"分类
+                                        if (prof === '其它系统' || prof === '其他系统') return;
+                                        const key = prof + '|' + subcontract;
+                                        if (!crossStats[key]) {{
+                                            crossStats[key] = {{prof: prof, subcontract: subcontract, count: 0, amount: 0}};
+                                        }}
+                                        crossStats[key].count++;
+                                        crossStats[key].amount += parseFloat(d.拟定金额) || 0;
+                                    }});
+                                    return Object.keys(crossStats).sort((a, b) => crossStats[b].amount - crossStats[a].amount).map(key => {{
+                                        const stats = crossStats[key];
+                                        return `
+                                            <tr>
+                                                <td>${{stats.prof || '未分类'}}</td>
+                                                <td>${{stats.subcontract || '未分类'}}</td>
+                                                <td>${{stats.count}}</td>
+                                                <td>${{formatCurrency(stats.amount)}}</td>
+                                            </tr>
+                                        `;
+                                    }}).join('');
+                                }})()}}
+                            </tbody>
+                        </table>
+                    </div>
+                    ` : ''}}
+                    
+                    ${{implCol ? `
+                    <h3>🔧 项目实施状态分析</h3>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-label">已实施项目数</div>
+                            <div class="metric-value">${{已实施项目.length}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">已实施金额（万元）</div>
+                            <div class="metric-value">${{formatCurrency(已实施项目.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">未实施项目数</div>
+                            <div class="metric-value">${{未实施项目.length}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">未实施金额（万元）</div>
+                            <div class="metric-value">${{formatCurrency(未实施项目.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">实施率</div>
+                            <div class="metric-value">${{validData.length > 0 ? (已实施项目.length / validData.length * 100).toFixed(1) : 0}}%</div>
+                        </div>
+                    </div>
+                    
+                    <h4>各园区实施情况统计</h4>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>园区</th><th>总项目数</th><th>已实施数</th><th>未实施数</th><th>总金额（万元）</th><th>已实施金额（万元）</th><th>实施率(%)</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(parkImplStats).sort((a, b) => parkImplStats[b].amount - parkImplStats[a].amount).map(park => {{
+                                    const stats = parkImplStats[park];
+                                    const rate = stats.total > 0 ? (stats.implemented / stats.total * 100).toFixed(1) : 0;
+                                    return `
+                                        <tr>
+                                            <td>${{park}}</td>
+                                            <td>${{stats.total}}</td>
+                                            <td>${{stats.implemented}}</td>
+                                            <td>${{stats.total - stats.implemented}}</td>
+                                            <td>${{formatCurrency(stats.amount)}}</td>
+                                            <td>${{formatCurrency(stats.implAmount)}}</td>
+                                            <td>${{rate}}%</td>
+                                        </tr>
+                                    `;
+                                }}).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    ` : '<div class="info-box">未找到实施日期列，无法进行实施状态分析。</div>'
+                    }}
+                    
+                    <h3>🏢 各园区分类项目统计</h3>
+                    
+                    ${{(() => {{
+                        const totalLevel1 = Object.values(parkAnalysis).reduce((sum, s) => sum + s.level1, 0);
+                        const totalHq = Object.values(parkAnalysis).reduce((sum, s) => sum + s.hq, 0);
+                        const totalMajor = Object.values(parkAnalysis).reduce((sum, s) => sum + s.major, 0);
+                        const totalAll = Object.values(parkAnalysis).reduce((sum, s) => sum + s.total, 0);
+                        return `
+                            <div class="metrics">
+                                <div class="metric">
+                                    <div class="metric-label">一级项目总金额</div>
+                                    <div class="metric-value">${{formatCurrency(totalLevel1)}} 万元</div>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-label">总部项目总金额</div>
+                                    <div class="metric-value">${{formatCurrency(totalHq)}} 万元</div>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-label">重大改造项目总金额</div>
+                                    <div class="metric-value">${{formatCurrency(totalMajor)}} 万元</div>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-label">所有项目总金额</div>
+                                    <div class="metric-value">${{formatCurrency(totalAll)}} 万元</div>
+                                </div>
+                            </div>
+                        `;
+                    }})()}}
+                    
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>园区</th><th>一级项目金额（万元）</th><th>一级项目占比(%)</th><th>总部项目金额（万元）</th><th>总部项目占比(%)</th><th>重大改造项目数</th><th>重大改造项目金额（万元）</th><th>重大改造项目占比(%)</th><th>总金额（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(parkAnalysis).sort((a, b) => parkAnalysis[b].total - parkAnalysis[a].total).map(park => {{
+                                    const stats = parkAnalysis[park];
+                                    const level1Percent = stats.total > 0 ? (stats.level1 / stats.total * 100).toFixed(2) : 0;
+                                    const hqPercent = stats.total > 0 ? (stats.hq / stats.total * 100).toFixed(2) : 0;
+                                    const majorPercent = stats.total > 0 ? (stats.major / stats.total * 100).toFixed(2) : 0;
+                                    return `
+                                        <tr>
+                                            <td>${{park}}</td>
+                                            <td>${{formatCurrency(stats.level1)}}</td>
+                                            <td>${{level1Percent}}%</td>
+                                            <td>${{formatCurrency(stats.hq)}}</td>
+                                            <td>${{hqPercent}}%</td>
+                                            <td>${{stats.majorCount}}</td>
+                                            <td>${{formatCurrency(stats.major)}}</td>
+                                            <td>${{majorPercent}}%</td>
+                                            <td>${{formatCurrency(stats.total)}}</td>
+                                        </tr>
+                                    `;
+                                }}).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h4>各园区分类项目统计（金额、项目数与占比）</h4>
+                    <div class="chart-container">
+                        <div id="chart-park-combined"></div>
+                    </div>
+                    
+                    <h4>各园区分类项目金额统计（对数刻度）</h4>
+                    <div class="chart-container">
+                        <div id="chart-park-log-scale"></div>
+                    </div>
+                    
+                    <h4>各园区分类项目统计（单独图表）</h4>
+                    <div class="chart-container">
+                        <div id="chart-park-level1"></div>
+                    </div>
+                    <div class="chart-container">
+                        <div id="chart-park-hq"></div>
+                    </div>
+                    <div class="chart-container">
+                        <div id="chart-park-major-amount"></div>
+                    </div>
+                    <div class="chart-container">
+                        <div id="chart-park-major-count"></div>
+                    </div>
+                    
+                    ${{立项Col ? `
+                    <h3>✅ 项目确定状态分析</h3>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-label">已确定项目数（有立项日期）</div>
+                            <div class="metric-value">${{确定项目.length}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">已确定金额合计（万元）</div>
+                            <div class="metric-value">${{formatCurrency(确定项目.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">未确定项目数（无立项日期）</div>
+                            <div class="metric-value">${{未确定项目.length}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">未确定金额合计（万元）</div>
+                            <div class="metric-value">${{formatCurrency(未确定项目.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                        </div>
+                    </div>
+                    
+                    <h4>确定率统计</h4>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>园区</th><th>总项目数</th><th>已确定数</th><th>未确定数</th><th>确定率(%)</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(parkDeterminationStats).map(park => {{
+                                    const stats = parkDeterminationStats[park];
+                                    const rate = stats.total > 0 ? (stats.determined / stats.total * 100).toFixed(1) : 0;
+                                    return `
+                                        <tr>
+                                            <td>${{park}}</td>
+                                            <td>${{stats.total}}</td>
+                                            <td>${{stats.determined}}</td>
+                                            <td>${{stats.total - stats.determined}}</td>
+                                            <td>${{rate}}%</td>
+                                        </tr>
+                                    `;
+                                }}).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    ${{Object.keys(monthlyStats).length > 0 ? `
+                    <h3>📅 按月份统计立项</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>立项月份</th><th>立项项目数</th><th>立项金额（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(monthlyStats).sort().map(month => `
+                                    <tr>
+                                        <td>${{month}}</td>
+                                        <td>${{monthlyStats[month].count}}</td>
+                                        <td>${{formatCurrency(monthlyStats[month].amount)}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <div class="chart-container">
+                        <div id="chart-monthly-count"></div>
+                    </div>
+                    <div class="chart-container">
+                        <div id="chart-monthly-amount"></div>
+                    </div>
+                    ` : ''
+                    }}
+                    ` : '<div class="info-box">未找到立项日期列，无法进行确定/未确定项目分析。</div>'
+                    }}
+                </div>
+            `;
+            
+            container.innerHTML = html;
+            
+            // 渲染图表
+            setTimeout(() => {{
+                const levelLabels = Object.keys(levelStatsMapped);
+                const levelCounts = levelLabels.map(l => levelStatsMapped[l].count);
+                const levelAmounts = levelLabels.map(l => levelStatsMapped[l].amount);
+                
+                Plotly.newPlot('chart-level-count', [{{
+                    values: levelCounts,
+                    labels: levelLabels,
+                    type: 'pie',
+                    textinfo: 'label+percent+value',
+                    textposition: 'outside',
+                    marker: {{colors: ['#FF6B6B', '#4ECDC4', '#45B7D1']}}
+                }}], {{
+                    title: '项目数量占比',
+                    showlegend: true
+                }}, {{displayModeBar: false}});
+                
+                Plotly.newPlot('chart-level-amount', [{{
+                    values: levelAmounts,
+                    labels: levelLabels,
+                    type: 'pie',
+                    textinfo: 'label+percent+value',
+                    textposition: 'outside',
+                    marker: {{colors: ['#FF6B6B', '#4ECDC4', '#45B7D1']}}
+                }}], {{
+                    title: '项目金额占比',
+                    showlegend: true
+                }}, {{displayModeBar: false}});
+                
+                // 各园区分类项目图表
+                const parkLabels = Object.keys(parkAnalysis).sort((a, b) => parkAnalysis[b].total - parkAnalysis[a].total);
+                const level1Amounts = parkLabels.map(p => parkAnalysis[p].level1);
+                const hqAmounts = parkLabels.map(p => parkAnalysis[p].hq);
+                const majorAmounts = parkLabels.map(p => parkAnalysis[p].major);
+                const majorCounts = parkLabels.map(p => parkAnalysis[p].majorCount);
+                const level1Percents = parkLabels.map(p => parkAnalysis[p].total > 0 ? (parkAnalysis[p].level1 / parkAnalysis[p].total * 100).toFixed(2) : 0);
+                const hqPercents = parkLabels.map(p => parkAnalysis[p].total > 0 ? (parkAnalysis[p].hq / parkAnalysis[p].total * 100).toFixed(2) : 0);
+                const majorPercents = parkLabels.map(p => parkAnalysis[p].total > 0 ? (parkAnalysis[p].major / parkAnalysis[p].total * 100).toFixed(2) : 0);
+                
+                // 复杂整合图表（多Y轴）
+                const maxAmount = Math.max(...level1Amounts, ...hqAmounts, ...majorAmounts);
+                const maxCount = Math.max(...majorCounts);
+                const scaleFactor = maxCount > 0 && maxAmount > 0 ? maxAmount / (maxCount * 50) : 1;
+                const scaledCounts = majorCounts.map(c => c * scaleFactor);
+                
+                Plotly.newPlot('chart-park-combined', [
+                    // 一级项目金额
+                    {{
+                        x: parkLabels,
+                        y: level1Amounts,
+                        type: 'bar',
+                        name: '一级项目金额（万元）',
+                        marker: {{color: '#5470c6', line: {{color: '#3a5a9c', width: 1}}}},
+                        text: level1Amounts.map(a => a > 0 ? formatCurrency(a) + '万' : ''),
+                        textposition: 'outside',
+                        yaxis: 'y'
+                    }},
+                    // 总部项目金额
+                    {{
+                        x: parkLabels,
+                        y: hqAmounts,
+                        type: 'bar',
+                        name: '总部项目金额（万元）',
+                        marker: {{color: '#91cc75', line: {{color: '#6fa85a', width: 1}}}},
+                        text: hqAmounts.map(a => a > 0 ? formatCurrency(a) + '万' : ''),
+                        textposition: 'outside',
+                        yaxis: 'y'
+                    }},
+                    // 重大改造项目金额
+                    {{
+                        x: parkLabels,
+                        y: majorAmounts,
+                        type: 'bar',
+                        name: '重大改造项目金额（万元）',
+                        marker: {{color: '#fac858', line: {{color: '#d4a84a', width: 1}}}},
+                        text: majorAmounts.map(a => a > 0 ? formatCurrency(a) + '万' : ''),
+                        textposition: 'outside',
+                        yaxis: 'y'
+                    }},
+                    // 重大改造项目数量（缩放后）
+                    {{
+                        x: parkLabels,
+                        y: scaledCounts,
+                        type: 'bar',
+                        name: '重大改造项目数（个）',
+                        marker: {{color: '#73c0de', line: {{color: '#4a9bc0', width: 1.5}}}},
+                        text: majorCounts.map(c => c > 0 ? c + '个' : ''),
+                        textposition: 'inside',
+                        opacity: 0.85,
+                        yaxis: 'y'
+                    }},
+                    // 一级项目占比
+                    {{
+                        x: parkLabels,
+                        y: level1Percents,
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        name: '一级项目占比（%）',
+                        marker: {{color: '#ee6666', size: 10, line: {{width: 2, color: 'white'}}, symbol: 'circle'}},
+                        line: {{color: '#ee6666', width: 3}},
+                        yaxis: 'y2'
+                    }},
+                    // 总部项目占比
+                    {{
+                        x: parkLabels,
+                        y: hqPercents,
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        name: '总部项目占比（%）',
+                        marker: {{color: '#ff9800', size: 10, line: {{width: 2, color: 'white'}}, symbol: 'square'}},
+                        line: {{color: '#ff9800', width: 3, dash: 'dash'}},
+                        yaxis: 'y2'
+                    }},
+                    // 重大改造项目占比
+                    {{
+                        x: parkLabels,
+                        y: majorPercents,
+                        type: 'scatter',
+                        mode: 'lines+markers',
+                        name: '重大改造项目占比（%）',
+                        marker: {{color: '#9c27b0', size: 10, line: {{width: 2, color: 'white'}}, symbol: 'diamond'}},
+                        line: {{color: '#9c27b0', width: 3, dash: 'dot'}},
+                        yaxis: 'y2'
+                    }}
+                ], {{
+                    title: '各园区分类项目统计（金额、项目数与占比）',
+                    xaxis: {{tickangle: -45, title: '园区'}},
+                    yaxis: {{title: '金额（万元）', side: 'left'}},
+                    yaxis2: {{title: '占比（%）', side: 'right', overlaying: 'y', range: [0, 105]}},
+                    barmode: 'group',
+                    height: 700,
+                    showlegend: true,
+                    legend: {{orientation: 'h', yanchor: 'bottom', y: -0.18, xanchor: 'center', x: 0.5}}
+                }}, {{displayModeBar: false}});
+                
+                // 对数刻度图表
+                const maxTotal = Math.max(...parkLabels.map(p => parkAnalysis[p].total));
+                const minTotal = Math.min(...parkLabels.filter(p => parkAnalysis[p].total > 0).map(p => parkAnalysis[p].total));
+                let tickVals = null;
+                let tickTexts = null;
+                if (maxTotal > 0 && minTotal > 0 && maxTotal > minTotal * 2) {{
+                    const logMin = Math.log10(Math.max(1, minTotal));
+                    const logMax = Math.log10(maxTotal);
+                    tickVals = [];
+                    tickTexts = [];
+                    for (let exp = Math.floor(logMin); exp <= Math.ceil(logMax); exp++) {{
+                        for (let mult of [1, 2, 5]) {{
+                            const val = mult * Math.pow(10, exp);
+                            if (val >= Math.max(1, minTotal * 0.5) && val <= maxTotal * 1.5) {{
+                                tickVals.push(val);
+                                if (val >= 1000) {{
+                                    tickTexts.push((val / 1000).toFixed(1) + '千');
+                                }} else if (val >= 100) {{
+                                    tickTexts.push(Math.floor(val).toString());
+                                }} else {{
+                                    tickTexts.push(val.toString());
+                                }}
+                            }}
+                        }}
+                    }}
+                    // 去重并排序
+                    const pairs = Array.from(new Set(tickVals.map((v, i) => [v, tickTexts[i]]))).sort((a, b) => a[0] - b[0]);
+                    tickVals = pairs.map(p => p[0]);
+                    tickTexts = pairs.map(p => p[1]);
+                }}
+                
+                Plotly.newPlot('chart-park-log-scale', [
+                    {{
+                        x: parkLabels,
+                        y: level1Amounts,
+                        type: 'bar',
+                        name: '一级项目金额（万元）',
+                        marker: {{color: '#5470c6', line: {{color: '#3a5a9c', width: 1}}}},
+                        text: level1Amounts.map(a => a > 0 ? formatCurrency(a) : ''),
+                        textposition: 'outside'
+                    }},
+                    {{
+                        x: parkLabels,
+                        y: hqAmounts,
+                        type: 'bar',
+                        name: '总部项目金额（万元）',
+                        marker: {{color: '#91cc75', line: {{color: '#6fa85a', width: 1}}}},
+                        text: hqAmounts.map(a => a > 0 ? formatCurrency(a) : ''),
+                        textposition: 'outside'
+                    }},
+                    {{
+                        x: parkLabels,
+                        y: majorAmounts,
+                        type: 'bar',
+                        name: '重大改造项目金额（万元）',
+                        marker: {{color: '#fac858', line: {{color: '#d4a84a', width: 1}}}},
+                        text: majorAmounts.map(a => a > 0 ? formatCurrency(a) : ''),
+                        textposition: 'outside'
+                    }}
+                ], {{
+                    title: '各园区分类项目金额统计（对数刻度，保证小金额园区可见性）',
+                    xaxis: {{tickangle: -45, title: '园区'}},
+                    yaxis: {{
+                        title: '金额（万元，对数刻度）',
+                        type: 'log',
+                        tickvals: tickVals,
+                        ticktext: tickTexts
+                    }},
+                    barmode: 'group',
+                    height: 600,
+                    showlegend: true,
+                    legend: {{orientation: 'h', yanchor: 'bottom', y: -0.15, xanchor: 'center', x: 0.5}}
+                }}, {{displayModeBar: false}});
+                
+                Plotly.newPlot('chart-park-level1', [{{
+                    x: parkLabels,
+                    y: level1Amounts,
+                    type: 'bar',
+                    text: level1Amounts.map(a => formatCurrency(a)),
+                    textposition: 'outside',
+                    marker: {{color: '#FF6B6B'}}
+                }}], {{
+                    title: '各园区一级项目金额（万元）',
+                    xaxis: {{tickangle: -45}},
+                    yaxis: {{title: '金额（万元）'}},
+                    showlegend: false,
+                    height: 350
+                }}, {{displayModeBar: false}});
+                
+                Plotly.newPlot('chart-park-hq', [{{
+                    x: parkLabels,
+                    y: hqAmounts,
+                    type: 'bar',
+                    text: hqAmounts.map(a => formatCurrency(a)),
+                    textposition: 'outside',
+                    marker: {{color: '#4ECDC4'}}
+                }}], {{
+                    title: '各园区总部项目金额（万元）',
+                    xaxis: {{tickangle: -45}},
+                    yaxis: {{title: '金额（万元）'}},
+                    showlegend: false,
+                    height: 350
+                }}, {{displayModeBar: false}});
+                
+                Plotly.newPlot('chart-park-major-amount', [{{
+                    x: parkLabels,
+                    y: majorAmounts,
+                    type: 'bar',
+                    text: majorAmounts.map(a => formatCurrency(a)),
+                    textposition: 'outside',
+                    marker: {{color: '#45B7D1'}}
+                }}], {{
+                    title: '各园区重大改造项目金额（万元，≥200万）',
+                    xaxis: {{tickangle: -45}},
+                    yaxis: {{title: '金额（万元）'}},
+                    showlegend: false,
+                    height: 350
+                }}, {{displayModeBar: false}});
+                
+                Plotly.newPlot('chart-park-major-count', [{{
+                    x: parkLabels,
+                    y: majorCounts,
+                    type: 'bar',
+                    text: majorCounts,
+                    textposition: 'outside',
+                    marker: {{color: '#9a60b4'}}
+                }}], {{
+                    title: '各园区重大改造项目数量（≥200万）',
+                    xaxis: {{tickangle: -45}},
+                    yaxis: {{title: '项目数'}},
+                    showlegend: false,
+                    height: 350
+                }}, {{displayModeBar: false}});
+                
+                // 按月份统计图表
+                if (Object.keys(monthlyStats).length > 0) {{
+                    const months = Object.keys(monthlyStats).sort();
+                    const monthlyCounts = months.map(m => monthlyStats[m].count);
+                    const monthlyAmounts = months.map(m => monthlyStats[m].amount);
+                    
+                    Plotly.newPlot('chart-monthly-count', [{{
+                        x: months,
+                        y: monthlyCounts,
+                        type: 'bar',
+                        text: monthlyCounts,
+                        textposition: 'outside',
+                        marker: {{color: '#5470c6'}}
+                    }}], {{
+                        title: '每月立项项目数',
+                        xaxis: {{tickangle: -45}},
+                        yaxis: {{title: '项目数'}},
+                        showlegend: false,
+                        height: 350
+                    }}, {{displayModeBar: false}});
+                    
+                    Plotly.newPlot('chart-monthly-amount', [{{
+                        x: months,
+                        y: monthlyAmounts,
+                        type: 'bar',
+                        text: monthlyAmounts.map(a => formatCurrency(a)),
+                        textposition: 'outside',
+                        marker: {{color: '#91cc75'}}
+                    }}], {{
+                        title: '每月立项金额（万元）',
+                        xaxis: {{tickangle: -45}},
+                        yaxis: {{title: '金额（万元）'}},
+                        showlegend: false,
+                        height: 350
+                    }}, {{displayModeBar: false}});
+                }}
+                
+                // 专业分包统计图表
+                if (validData[0] && (validData[0].专业分包 || validData[0].专业细分)) {{
+                    const profSubcontractCol = validData[0].专业分包 ? '专业分包' : '专业细分';
+                    const profSubcontractStats = {{}};
+                    validData.forEach(d => {{
+                        const val = d[profSubcontractCol] || '未分类';
+                        if (!profSubcontractStats[val]) {{
+                            profSubcontractStats[val] = {{count: 0, amount: 0}};
+                        }}
+                        profSubcontractStats[val].count++;
+                        profSubcontractStats[val].amount += parseFloat(d.拟定金额) || 0;
+                    }});
+                    
+                    const profSubcontractLabels = Object.keys(profSubcontractStats).sort((a, b) => profSubcontractStats[b].amount - profSubcontractStats[a].amount);
+                    const profSubcontractCounts = profSubcontractLabels.map(l => profSubcontractStats[l].count);
+                    const profSubcontractAmounts = profSubcontractLabels.map(l => profSubcontractStats[l].amount);
+                    
+                    const colors = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de', '#3ba272', '#fc8452', '#9a60b4'];
+                    
+                    Plotly.newPlot('chart-prof-subcontract-count', [{{
+                        values: profSubcontractCounts,
+                        labels: profSubcontractLabels,
+                        type: 'pie',
+                        textinfo: 'label+percent+value',
+                        textposition: 'outside',
+                        marker: {{colors: colors.slice(0, profSubcontractLabels.length)}}
+                    }}], {{
+                        title: '专业分包项目数占比',
+                        showlegend: true
+                    }}, {{displayModeBar: false}});
+                    
+                    Plotly.newPlot('chart-prof-subcontract-amount', [{{
+                        values: profSubcontractAmounts,
+                        labels: profSubcontractLabels,
+                        type: 'pie',
+                        textinfo: 'label+percent+value',
+                        textposition: 'outside',
+                        marker: {{colors: colors.slice(0, profSubcontractLabels.length)}}
+                    }}], {{
+                        title: '专业分包金额占比',
+                        showlegend: true
+                    }}, {{displayModeBar: false}});
+                }}
+            }}, 100);
+        }}
+        
+        // 标签页1: 统计
+        function renderTab1() {{
+            const validData = getValidProjects(filteredData);
+            const container = document.getElementById('tab-1');
+            
+            if (validData.length === 0) {{
+                container.innerHTML = '<div class="warning-box">当前筛选条件下暂无数据。</div>';
+                return;
+            }}
+            
+            // 按专业统计（过滤掉"其它系统"）
+            const profStats = {{}};
+            validData.forEach(d => {{
+                const prof = d.专业 || '未分类';
+                // 过滤掉"其它系统"分类
+                if (prof === '其它系统' || prof === '其他系统') return;
+                if (!profStats[prof]) {{
+                    profStats[prof] = {{count: 0, amount: 0}};
+                }}
+                profStats[prof].count++;
+                profStats[prof].amount += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 按项目分级统计金额
+            const levelAmountStats = {{}};
+            validData.forEach(d => {{
+                const level = d.项目分级 || '未分类';
+                if (!levelAmountStats[level]) {{
+                    levelAmountStats[level] = 0;
+                }}
+                levelAmountStats[level] += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 按园区统计金额
+            const parkAmountStats = {{}};
+            validData.forEach(d => {{
+                const park = d.园区 || '未知';
+                if (!parkAmountStats[park]) {{
+                    parkAmountStats[park] = 0;
+                }}
+                parkAmountStats[park] += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 按城市统计金额
+            const cityAmountStats = {{}};
+            validData.forEach(d => {{
+                const city = d.城市 || '其他';
+                if (city !== '其他') {{
+                    if (!cityAmountStats[city]) {{
+                        cityAmountStats[city] = 0;
+                    }}
+                    cityAmountStats[city] += parseFloat(d.拟定金额) || 0;
+                }}
+            }});
+            
+            // 按区域统计金额
+            const regionAmountStats = {{}};
+            validData.forEach(d => {{
+                const region = d.所属区域 || '其他';
+                if (region !== '其他') {{
+                    if (!regionAmountStats[region]) {{
+                        regionAmountStats[region] = 0;
+                    }}
+                    regionAmountStats[region] += parseFloat(d.拟定金额) || 0;
+                }}
+            }});
+            
+            // 按专业分包统计（如果存在）
+            const hasProfSubcontract = validData[0] && (validData[0].专业分包 || validData[0].专业细分);
+            const profSubcontractCol = hasProfSubcontract ? (validData[0].专业分包 ? '专业分包' : '专业细分') : null;
+            const profSubcontractStats = {{}};
+            if (hasProfSubcontract) {{
+                validData.forEach(d => {{
+                    const val = d[profSubcontractCol] || '未分类';
+                    if (!profSubcontractStats[val]) {{
+                        profSubcontractStats[val] = {{count: 0, amount: 0}};
+                    }}
+                    profSubcontractStats[val].count++;
+                    profSubcontractStats[val].amount += parseFloat(d.拟定金额) || 0;
+                }});
+            }}
+            
+            // 按区域统计（详细统计，包含项目数、金额、园区数）
+            const regionDetailedStats = {{}};
+            validData.forEach(d => {{
+                const region = d.所属区域 || '其他';
+                if (region !== '其他') {{
+                    if (!regionDetailedStats[region]) {{
+                        regionDetailedStats[region] = {{count: 0, amount: 0, parks: new Set()}};
+                    }}
+                    regionDetailedStats[region].count++;
+                    regionDetailedStats[region].amount += parseFloat(d.拟定金额) || 0;
+                    if (d.园区) regionDetailedStats[region].parks.add(d.园区);
+                }}
+            }});
+            
+            // 按区域下各园区统计
+            const regionParkDetails = {{}};
+            Object.keys(regionDetailedStats).forEach(region => {{
+                const regionData = validData.filter(d => d.所属区域 === region);
+                const parkStatsInRegion = {{}};
+                regionData.forEach(d => {{
+                    const park = d.园区 || '未知';
+                    if (!parkStatsInRegion[park]) {{
+                        parkStatsInRegion[park] = {{count: 0, amount: 0}};
+                    }}
+                    parkStatsInRegion[park].count++;
+                    parkStatsInRegion[park].amount += parseFloat(d.拟定金额) || 0;
+                }});
+                regionParkDetails[region] = parkStatsInRegion;
+            }});
+            
+            let html = `
+                <div class="section">
+                    ${{Object.keys(regionDetailedStats).length > 0 ? `
+                    <h2>📊 按区域统计分析</h2>
+                    
+                    <h3>各区域项目统计</h3>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-label">总区域数</div>
+                            <div class="metric-value">${{Object.keys(regionDetailedStats).length}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">总项目数</div>
+                            <div class="metric-value">${{formatNumber(Object.values(regionDetailedStats).reduce((sum, r) => sum + r.count, 0))}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">总金额（万元）</div>
+                            <div class="metric-value">${{formatCurrency(Object.values(regionDetailedStats).reduce((sum, r) => sum + r.amount, 0))}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">总园区数</div>
+                            <div class="metric-value">${{formatNumber(Object.values(regionDetailedStats).reduce((sum, r) => sum + r.parks.size, 0))}}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>所属区域</th><th>项目数</th><th>金额合计（万元）</th><th>园区数</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(regionDetailedStats).sort((a, b) => regionDetailedStats[b].count - regionDetailedStats[a].count).map(region => {{
+                                    const stats = regionDetailedStats[region];
+                                    return `
+                                        <tr>
+                                            <td>${{region}}</td>
+                                            <td>${{stats.count}}</td>
+                                            <td>${{formatCurrency(stats.amount)}}</td>
+                                            <td>${{stats.parks.size}}</td>
+                                        </tr>
+                                    `;
+                                }}).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h3>各区域下园区明细</h3>
+                    ${{Object.keys(regionDetailedStats).sort((a, b) => regionDetailedStats[b].count - regionDetailedStats[a].count).map(region => {{
+                        const stats = regionDetailedStats[region];
+                        const parkDetails = regionParkDetails[region];
+                        return `
+                            <div class="expander">
+                                <div class="expander-header" onclick="toggleExpander(this)">
+                                    <span><strong>${{region}}</strong>（${{Object.keys(parkDetails).length}}个园区，${{stats.count}}个项目，${{formatCurrency(stats.amount)}}万元）</span>
+                                    <span class="expander-icon">▶</span>
+                                </div>
+                                <div class="expander-content">
+                                    <div class="data-table-container">
+                                        <table>
+                                            <thead>
+                                                <tr><th>园区</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                ${{Object.keys(parkDetails).sort((a, b) => parkDetails[b].amount - parkDetails[a].amount).map(park => `
+                                                    <tr>
+                                                        <td>${{park}}</td>
+                                                        <td>${{parkDetails[park].count}}</td>
+                                                        <td>${{formatCurrency(parkDetails[park].amount)}}</td>
+                                                    </tr>
+                                                `).join('')}}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }}).join('')}}
+                    
+                    <hr style="margin: 30px 0;"/>
+                    ` : ''}}
+                    
+                    <h2>📊 图表统计</h2>
+                    
+                    <h3>按专业 · 项目数</h3>
+                    <div class="chart-container">
+                        <div id="chart-prof-count"></div>
+                    </div>
+                    
+                    <h3>按项目分级 · 金额占比</h3>
+                    <div class="chart-container">
+                        <div id="chart-level-amount-pie"></div>
+                    </div>
+                    
+                    <h3>按园区 · 金额（万元）</h3>
+                    <div class="chart-container">
+                        <div id="chart-park-amount"></div>
+                    </div>
+                    
+                    <h3>按城市 · 金额（万元）</h3>
+                    <div class="chart-container">
+                        <div id="chart-city-amount"></div>
+                    </div>
+                    
+                    <h3>按所属区域 · 金额分布（万元）</h3>
+                    <div class="chart-container">
+                        <div id="chart-region-amount"></div>
+                    </div>
+                    
+                    <h3>按专业 · 金额合计（万元）</h3>
+                    <div class="chart-container">
+                        <div id="chart-prof-amount"></div>
+                    </div>
+                    
+                    ${{hasProfSubcontract ? `
+                    <h3>按专业分包 · 项目数</h3>
+                    <div class="chart-container">
+                        <div id="chart-prof-subcontract-count-tab1"></div>
+                    </div>
+                    
+                    <h3>按专业分包 · 金额占比</h3>
+                    <div class="chart-container">
+                        <div id="chart-prof-subcontract-amount-tab1"></div>
+                    </div>
+                    ` : ''}}
+                </div>
+            `;
+            
+            container.innerHTML = html;
+            
+            // 渲染图表
+            setTimeout(() => {{
+                // 按专业项目数
+                const profLabels = Object.keys(profStats).sort((a, b) => profStats[b].count - profStats[a].count);
+                const profCounts = profLabels.map(p => profStats[p].count);
+                Plotly.newPlot('chart-prof-count', [{{
+                    x: profLabels,
+                    y: profCounts,
+                    type: 'bar',
+                    marker: {{color: profCounts, colorscale: 'Blues'}},
+                    text: profCounts,
+                    textposition: 'outside'
+                }}], {{
+                    xaxis: {{tickangle: -45}},
+                    yaxis: {{title: '项目数'}},
+                    showlegend: false,
+                    margin: {{t: 20, b: 80}}
+                }}, {{displayModeBar: false}});
+                
+                // 按项目分级金额占比
+                const levelLabels = Object.keys(levelAmountStats);
+                const levelAmounts = levelLabels.map(l => levelAmountStats[l]);
+                Plotly.newPlot('chart-level-amount-pie', [{{
+                    values: levelAmounts,
+                    labels: levelLabels,
+                    type: 'pie',
+                    hole: 0.35,
+                    textinfo: 'label+percent+value',
+                    textposition: 'outside',
+                    texttemplate: '%{{label}}<br>%{{percent}}<br>%{{value:,.0f}}万元'
+                }}], {{
+                    showlegend: true,
+                    legend: {{orientation: 'h', yanchor: 'bottom', y: -0.2}}
+                }}, {{displayModeBar: false}});
+                
+                // 按园区金额
+                const parkLabels = Object.keys(parkAmountStats).sort((a, b) => parkAmountStats[b] - parkAmountStats[a]).slice(0, 20);
+                const parkAmounts = parkLabels.map(p => parkAmountStats[p]);
+                Plotly.newPlot('chart-park-amount', [{{
+                    x: parkLabels,
+                    y: parkAmounts,
+                    type: 'bar',
+                    marker: {{color: parkAmounts, colorscale: 'Blues'}},
+                    text: parkAmounts.map(a => formatCurrency(a)),
+                    textposition: 'outside'
+                }}], {{
+                    xaxis: {{tickangle: -45}},
+                    yaxis: {{title: '金额（万元）'}},
+                    showlegend: false,
+                    margin: {{t: 20, b: 80}}
+                }}, {{displayModeBar: false}});
+                
+                // 按城市金额
+                const cityLabels = Object.keys(cityAmountStats).sort((a, b) => cityAmountStats[b] - cityAmountStats[a]);
+                const cityAmounts = cityLabels.map(c => cityAmountStats[c]);
+                if (cityLabels.length > 0) {{
+                    Plotly.newPlot('chart-city-amount', [{{
+                        x: cityLabels,
+                        y: cityAmounts,
+                        type: 'bar',
+                        marker: {{color: cityAmounts, colorscale: 'Teal'}},
+                        text: cityAmounts.map(a => formatCurrency(a)),
+                        textposition: 'outside'
+                    }}], {{
+                        xaxis: {{tickangle: -45}},
+                        yaxis: {{title: '金额（万元）'}},
+                        showlegend: false,
+                        margin: {{t: 20, b: 80}}
+                    }}, {{displayModeBar: false}});
+                }}
+                
+                // 按区域金额
+                const regionLabels = Object.keys(regionAmountStats).sort((a, b) => regionAmountStats[b] - regionAmountStats[a]);
+                const regionAmounts = regionLabels.map(r => regionAmountStats[r]);
+                if (regionLabels.length > 0) {{
+                    Plotly.newPlot('chart-region-amount', [{{
+                        values: regionAmounts,
+                        labels: regionLabels,
+                        type: 'pie',
+                        hole: 0.4,
+                        textinfo: 'label+percent+value',
+                        textposition: 'outside',
+                        texttemplate: '%{{label}}<br>%{{percent}}<br>%{{value:,.0f}}万元',
+                        marker: {{colors: ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8']}}
+                    }}], {{
+                        showlegend: true,
+                        legend: {{orientation: 'h', yanchor: 'bottom', y: -0.15}}
+                    }}, {{displayModeBar: false}});
+                }}
+                
+                // 按专业金额
+                const profAmountLabels = Object.keys(profStats).sort((a, b) => profStats[b].amount - profStats[a].amount);
+                const profAmounts = profAmountLabels.map(p => profStats[p].amount);
+                Plotly.newPlot('chart-prof-amount', [{{
+                    x: profAmountLabels,
+                    y: profAmounts,
+                    type: 'bar',
+                    marker: {{color: profAmounts, colorscale: 'Viridis'}},
+                    text: profAmounts.map(a => formatCurrency(a)),
+                    textposition: 'outside'
+                }}], {{
+                    xaxis: {{tickangle: -45}},
+                    yaxis: {{title: '金额（万元）'}},
+                    showlegend: false,
+                    margin: {{t: 20, b: 80}}
+                }}, {{displayModeBar: false}});
+                
+                // 按专业分包统计图表
+                if (hasProfSubcontract) {{
+                    const profSubcontractLabels = Object.keys(profSubcontractStats).sort((a, b) => profSubcontractStats[b].amount - profSubcontractStats[a].amount);
+                    const profSubcontractCounts = profSubcontractLabels.map(l => profSubcontractStats[l].count);
+                    const profSubcontractAmounts = profSubcontractLabels.map(l => profSubcontractStats[l].amount);
+                    const colors = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de', '#3ba272', '#fc8452', '#9a60b4'];
+                    
+                    Plotly.newPlot('chart-prof-subcontract-count-tab1', [{{
+                        x: profSubcontractLabels,
+                        y: profSubcontractCounts,
+                        type: 'bar',
+                        marker: {{color: profSubcontractCounts, colorscale: 'Blues'}},
+                        text: profSubcontractCounts,
+                        textposition: 'outside'
+                    }}], {{
+                        title: '按专业分包 · 项目数',
+                        xaxis: {{tickangle: -45}},
+                        yaxis: {{title: '项目数'}},
+                        showlegend: false,
+                        margin: {{t: 20, b: 80}},
+                        height: 400
+                    }}, {{displayModeBar: false}});
+                    
+                    Plotly.newPlot('chart-prof-subcontract-amount-tab1', [{{
+                        values: profSubcontractAmounts,
+                        labels: profSubcontractLabels,
+                        type: 'pie',
+                        hole: 0.35,
+                        textinfo: 'label+percent+value',
+                        textposition: 'outside',
+                        texttemplate: '%{{label}}<br>%{{percent}}<br>%{{value:,.0f}}万元',
+                        marker: {{colors: colors.slice(0, profSubcontractLabels.length)}}
+                    }}], {{
+                        title: '按专业分包 · 金额占比',
+                        showlegend: true,
+                        legend: {{orientation: 'h', yanchor: 'bottom', y: -0.2}}
+                    }}, {{displayModeBar: false}});
+                }}
+            }}, 100);
+        }}
+        
+        // 标签页2: 地区分析
+        function renderTab2() {{
+            const validData = getValidProjects(filteredData);
+            const container = document.getElementById('tab-2');
+            
+            if (validData.length === 0) {{
+                container.innerHTML = '<div class="warning-box">当前筛选条件下暂无数据。</div>';
+                return;
+            }}
+            
+            // 按区域统计
+            const regionStats = {{}};
+            validData.forEach(d => {{
+                const region = d.所属区域 || '其他';
+                if (region !== '其他') {{
+                    if (!regionStats[region]) {{
+                        regionStats[region] = {{
+                            count: 0,
+                            amount: 0,
+                            parks: new Set(),
+                            cities: new Set()
+                        }};
+                    }}
+                    regionStats[region].count++;
+                    regionStats[region].amount += parseFloat(d.拟定金额) || 0;
+                    if (d.园区) regionStats[region].parks.add(d.园区);
+                    if (d.城市) regionStats[region].cities.add(d.城市);
+                }}
+            }});
+            
+            let html = `
+                <div class="section">
+                    <h2>🌍 地区分析：按所属区域统计</h2>
+                    
+                    <h3>📊 区域总览</h3>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-label">总区域数</div>
+                            <div class="metric-value">${{Object.keys(regionStats).length}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">总项目数</div>
+                            <div class="metric-value">${{formatNumber(Object.values(regionStats).reduce((sum, r) => sum + r.count, 0))}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">总金额（万元）</div>
+                            <div class="metric-value">${{formatCurrency(Object.values(regionStats).reduce((sum, r) => sum + r.amount, 0))}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">总园区数</div>
+                            <div class="metric-value">${{formatNumber(Object.values(regionStats).reduce((sum, r) => sum + r.parks.size, 0))}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">总城市数</div>
+                            <div class="metric-value">${{formatNumber(Object.values(regionStats).reduce((sum, r) => sum + r.cities.size, 0))}}</div>
+                        </div>
+                    </div>
+                    
+                    <h4>各区域统计汇总</h4>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>所属区域</th><th>项目数</th><th>金额合计（万元）</th><th>平均项目金额（万元）</th><th>园区数</th><th>城市数</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(regionStats).sort((a, b) => regionStats[b].count - regionStats[a].count).map(region => {{
+                                    const stats = regionStats[region];
+                                    const avgAmount = stats.count > 0 ? (stats.amount / stats.count).toFixed(2) : 0;
+                                    return `
+                                        <tr>
+                                            <td>${{region}}</td>
+                                            <td>${{stats.count}}</td>
+                                            <td>${{formatCurrency(stats.amount)}}</td>
+                                            <td>${{avgAmount}}</td>
+                                            <td>${{stats.parks.size}}</td>
+                                            <td>${{stats.cities.size}}</td>
+                                        </tr>
+                                    `;
+                                }}).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h3>📈 区域对比分析</h3>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0;">
+                        <div class="chart-container">
+                            <div id="chart-region-count-bar"></div>
+                        </div>
+                        <div class="chart-container">
+                            <div id="chart-region-amount-bar"></div>
+                        </div>
+                        <div class="chart-container">
+                            <div id="chart-region-amount-pie"></div>
+                        </div>
+                        <div class="chart-container">
+                            <div id="chart-region-count-pie"></div>
+                        </div>
+                    </div>
+                    
+                    <h3>🔍 各区域详细分析</h3>
+                    ${{Object.keys(regionStats).sort((a, b) => regionStats[b].count - regionStats[a].count).map(region => {{
+                        const stats = regionStats[region];
+                        const regionData = validData.filter(d => d.所属区域 === region);
+                        
+                        // 按园区统计
+                        const parkStatsInRegion = {{}};
+                        regionData.forEach(d => {{
+                            const park = d.园区 || '未知';
+                            if (!parkStatsInRegion[park]) {{
+                                parkStatsInRegion[park] = {{count: 0, amount: 0}};
+                            }}
+                            parkStatsInRegion[park].count++;
+                            parkStatsInRegion[park].amount += parseFloat(d.拟定金额) || 0;
+                        }});
+                        
+                        // 按专业统计（过滤掉"其它系统"）
+                        const profStatsInRegion = {{}};
+                        regionData.forEach(d => {{
+                            const prof = d.专业 || '未分类';
+                            // 过滤掉"其它系统"分类
+                            if (prof === '其它系统' || prof === '其他系统') return;
+                            if (!profStatsInRegion[prof]) {{
+                                profStatsInRegion[prof] = {{count: 0, amount: 0}};
+                            }}
+                            profStatsInRegion[prof].count++;
+                            profStatsInRegion[prof].amount += parseFloat(d.拟定金额) || 0;
+                        }});
+                        
+                        // 按城市统计
+                        const cityStatsInRegion = {{}};
+                        regionData.forEach(d => {{
+                            const city = d.城市 || '未知';
+                            if (!cityStatsInRegion[city]) {{
+                                cityStatsInRegion[city] = {{count: 0, amount: 0, parks: new Set()}};
+                            }}
+                            cityStatsInRegion[city].count++;
+                            cityStatsInRegion[city].amount += parseFloat(d.拟定金额) || 0;
+                            if (d.园区) cityStatsInRegion[city].parks.add(d.园区);
+                        }});
+                        
+                        // 按项目分级统计
+                        const levelStatsInRegion = {{}};
+                        regionData.forEach(d => {{
+                            const level = d.项目分级 || '未分类';
+                            if (!levelStatsInRegion[level]) {{
+                                levelStatsInRegion[level] = {{count: 0, amount: 0}};
+                            }}
+                            levelStatsInRegion[level].count++;
+                            levelStatsInRegion[level].amount += parseFloat(d.拟定金额) || 0;
+                        }});
+                        
+                        return `
+                            <div class="expander">
+                                <div class="expander-header" onclick="toggleExpander(this)">
+                                    <span><strong>${{region}}</strong> - ${{stats.parks.size}}个园区，${{stats.count}}个项目，${{formatCurrency(stats.amount)}}万元</span>
+                                    <span class="expander-icon">▶</span>
+                                </div>
+                                <div class="expander-content">
+                                    <div class="metrics">
+                                        <div class="metric">
+                                            <div class="metric-label">项目数</div>
+                                            <div class="metric-value">${{stats.count}}</div>
+                                        </div>
+                                        <div class="metric">
+                                            <div class="metric-label">金额合计（万元）</div>
+                                            <div class="metric-value">${{formatCurrency(stats.amount)}}</div>
+                                        </div>
+                                        <div class="metric">
+                                            <div class="metric-label">园区数</div>
+                                            <div class="metric-value">${{stats.parks.size}}</div>
+                                        </div>
+                                        <div class="metric">
+                                            <div class="metric-label">城市数</div>
+                                            <div class="metric-value">${{stats.cities.size}}</div>
+                                        </div>
+                                    </div>
+                                    
+                                    <h4>各园区统计</h4>
+                                    <div class="data-table-container">
+                                        <table>
+                                            <thead>
+                                                <tr><th>园区</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                ${{Object.keys(parkStatsInRegion).sort((a, b) => parkStatsInRegion[b].amount - parkStatsInRegion[a].amount).map(park => `
+                                                    <tr>
+                                                        <td>${{park}}</td>
+                                                        <td>${{parkStatsInRegion[park].count}}</td>
+                                                        <td>${{formatCurrency(parkStatsInRegion[park].amount)}}</td>
+                                                    </tr>
+                                                `).join('')}}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    
+                                    <h4>各城市统计</h4>
+                                    <div class="data-table-container">
+                                        <table>
+                                            <thead>
+                                                <tr><th>城市</th><th>项目数</th><th>金额合计（万元）</th><th>园区数</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                ${{Object.keys(cityStatsInRegion).sort((a, b) => cityStatsInRegion[b].count - cityStatsInRegion[a].count).map(city => `
+                                                    <tr>
+                                                        <td>${{city}}</td>
+                                                        <td>${{cityStatsInRegion[city].count}}</td>
+                                                        <td>${{formatCurrency(cityStatsInRegion[city].amount)}}</td>
+                                                        <td>${{cityStatsInRegion[city].parks.size}}</td>
+                                                    </tr>
+                                                `).join('')}}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    
+                                    <h4>按专业分类统计</h4>
+                                    <div class="data-table-container">
+                                        <table>
+                                            <thead>
+                                                <tr><th>专业</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                ${{Object.keys(profStatsInRegion).sort((a, b) => profStatsInRegion[b].amount - profStatsInRegion[a].amount).map(prof => `
+                                                    <tr>
+                                                        <td>${{prof}}</td>
+                                                        <td>${{profStatsInRegion[prof].count}}</td>
+                                                        <td>${{formatCurrency(profStatsInRegion[prof].amount)}}</td>
+                                                    </tr>
+                                                `).join('')}}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    
+                                    <h4>按项目分级统计</h4>
+                                    <div class="data-table-container">
+                                        <table>
+                                            <thead>
+                                                <tr><th>项目分级</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                ${{Object.keys(levelStatsInRegion).sort((a, b) => levelStatsInRegion[b].count - levelStatsInRegion[a].count).map(level => `
+                                                    <tr>
+                                                        <td>${{level || '未分类'}}</td>
+                                                        <td>${{levelStatsInRegion[level].count}}</td>
+                                                        <td>${{formatCurrency(levelStatsInRegion[level].amount)}}</td>
+                                                    </tr>
+                                                `).join('')}}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    
+                                    <h4>项目明细（前20条）</h4>
+                                    <div class="data-table-container">
+                                        <table>
+                                            <thead>
+                                                <tr><th>园区</th><th>城市</th><th>序号</th><th>项目分级</th>${{regionData[0] && regionData[0].项目分类 ? '<th>项目分类</th>' : ''}}<th>专业</th><th>项目名称</th><th>拟定金额</th></tr>
+                                            </thead>
+                                            <tbody>
+                                                ${{regionData.slice(0, 20).map(d => `
+                                                    <tr>
+                                                        <td>${{getValue(d, '园区')}}</td>
+                                                        <td>${{getValue(d, '城市')}}</td>
+                                                        <td>${{getValue(d, '序号')}}</td>
+                                                        <td>${{getValue(d, '项目分级')}}</td>
+                                                        ${{d.项目分类 ? `<td>${{getValue(d, '项目分类')}}</td>` : ''}}
+                                                        <td>${{getValue(d, '专业')}}</td>
+                                                        <td>${{getValue(d, '项目名称')}}</td>
+                                                        <td>${{formatCurrency(getValue(d, '拟定金额'))}}</td>
+                                                    </tr>
+                                                `).join('')}}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    ${{regionData.length > 20 ? `<p style="color: #666; font-size: 12px; margin-top: 10px;">共 ${{regionData.length}} 条项目，仅显示前20条。可在「全部项目」Tab 中查看完整列表。</p>` : ''}}
+                                </div>
+                            </div>
+                        `;
+                    }}).join('')}}
+                </div>
+            `;
+            
+            container.innerHTML = html;
+            
+            // 渲染区域对比图表
+            setTimeout(() => {{
+                const regionLabels = Object.keys(regionStats).sort((a, b) => regionStats[b].count - regionStats[a].count);
+                const regionCounts = regionLabels.map(r => regionStats[r].count);
+                const regionAmounts = regionLabels.map(r => regionStats[r].amount);
+                const colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8'];
+                
+                // 第一个子图：项目数柱状图
+                Plotly.newPlot('chart-region-count-bar', [{{
+                    x: regionLabels,
+                    y: regionCounts,
+                    type: 'bar',
+                    marker: {{color: colors.slice(0, regionLabels.length)}},
+                    text: regionCounts,
+                    textposition: 'outside'
+                }}], {{
+                    title: '各区域项目数对比',
+                    xaxis: {{title: '所属区域', tickangle: 0}},
+                    yaxis: {{title: '项目数'}},
+                    showlegend: false,
+                    height: 350
+                }}, {{displayModeBar: false}});
+                
+                // 第二个子图：金额柱状图
+                Plotly.newPlot('chart-region-amount-bar', [{{
+                    x: regionLabels,
+                    y: regionAmounts,
+                    type: 'bar',
+                    marker: {{color: colors.slice(0, regionLabels.length)}},
+                    text: regionAmounts.map(a => formatCurrency(a)),
+                    textposition: 'outside'
+                }}], {{
+                    title: '各区域金额对比（万元）',
+                    xaxis: {{title: '所属区域', tickangle: 0}},
+                    yaxis: {{title: '金额（万元）'}},
+                    showlegend: false,
+                    height: 350
+                }}, {{displayModeBar: false}});
+                
+                // 第三个子图：金额分布饼图
+                Plotly.newPlot('chart-region-amount-pie', [{{
+                    values: regionAmounts,
+                    labels: regionLabels,
+                    type: 'pie',
+                    hole: 0.4,
+                    textinfo: 'label+percent+value',
+                    texttemplate: '%{{label}}<br>%{{percent}}<br>%{{value:,.0f}}万元',
+                    marker: {{colors: colors.slice(0, regionLabels.length)}}
+                }}], {{
+                    title: '各区域金额分布（万元）',
+                    showlegend: true,
+                    height: 350
+                }}, {{displayModeBar: false}});
+                
+                // 第四个子图：项目数分布饼图
+                Plotly.newPlot('chart-region-count-pie', [{{
+                    values: regionCounts,
+                    labels: regionLabels,
+                    type: 'pie',
+                    hole: 0.4,
+                    textinfo: 'label+percent+value',
+                    texttemplate: '%{{label}}<br>%{{percent}}<br>%{{value}}项',
+                    marker: {{colors: colors.slice(0, regionLabels.length)}}
+                }}], {{
+                    title: '各区域项目数分布',
+                    showlegend: true,
+                    height: 350
+                }}, {{displayModeBar: false}});
+            }}, 100);
+        }}
+        
+        // 标签页3: 各园区分级分类
+        function renderTab3() {{
+            const validData = getValidProjects(filteredData);
+            const container = document.getElementById('tab-3');
+            
+            if (validData.length === 0) {{
+                container.innerHTML = '<div class="warning-box">当前筛选条件下暂无数据。</div>';
+                return;
+            }}
+            
+            // 按分级统计
+            const levelStats = {{}};
+            validData.forEach(d => {{
+                const level = d.项目分级 || '未分类';
+                if (!levelStats[level]) {{
+                    levelStats[level] = {{count: 0, amount: 0}};
+                }}
+                levelStats[level].count++;
+                levelStats[level].amount += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 按专业统计（过滤掉"其它系统"）
+            const profStats = {{}};
+            validData.forEach(d => {{
+                const prof = d.专业 || '未分类';
+                // 过滤掉"其它系统"分类
+                if (prof === '其它系统' || prof === '其他系统') return;
+                if (!profStats[prof]) {{
+                    profStats[prof] = {{count: 0, amount: 0}};
+                }}
+                profStats[prof].count++;
+                profStats[prof].amount += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 按园区统计
+            const parkStats = {{}};
+            validData.forEach(d => {{
+                const park = d.园区 || '未知';
+                if (!parkStats[park]) {{
+                    parkStats[park] = {{count: 0, amount: 0}};
+                }}
+                parkStats[park].count++;
+                parkStats[park].amount += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 按专业分包统计（如果存在）
+            const hasProfSubcontract = validData[0] && (validData[0].专业分包 || validData[0].专业细分);
+            const profSubcontractCol = hasProfSubcontract ? (validData[0].专业分包 ? '专业分包' : '专业细分') : null;
+            const profSubcontractStats = {{}};
+            if (hasProfSubcontract) {{
+                validData.forEach(d => {{
+                    const val = d[profSubcontractCol] || '未分类';
+                    if (!profSubcontractStats[val]) {{
+                        profSubcontractStats[val] = {{count: 0, amount: 0}};
+                    }}
+                    profSubcontractStats[val].count++;
+                    profSubcontractStats[val].amount += parseFloat(d.拟定金额) || 0;
+                }});
+            }}
+            
+            let html = `
+                <div class="section">
+                    <h2>📋 各园区分级分类统计</h2>
+                    
+                    <h3>按紧急程度（分级）</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>项目分级</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(levelStats).map(level => `
+                                    <tr>
+                                        <td>${{level || '未分类'}}</td>
+                                        <td>${{levelStats[level].count}}</td>
+                                        <td>${{formatCurrency(levelStats[level].amount)}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h3>按专业分类</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>专业</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(profStats).map(prof => `
+                                    <tr>
+                                        <td>${{prof || '未分类'}}</td>
+                                        <td>${{profStats[prof].count}}</td>
+                                        <td>${{formatCurrency(profStats[prof].amount)}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    ${{hasProfSubcontract ? `
+                    <h3>按专业分包</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>专业分包</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(profSubcontractStats).sort((a, b) => profSubcontractStats[b].amount - profSubcontractStats[a].amount).map(key => `
+                                    <tr>
+                                        <td>${{key || '未分类'}}</td>
+                                        <td>${{profSubcontractStats[key].count}}</td>
+                                        <td>${{formatCurrency(profSubcontractStats[key].amount)}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    ` : ''}}
+                    
+                    <h3>按园区</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>园区</th><th>项目数</th><th>金额合计（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(parkStats).sort((a, b) => parkStats[b].amount - parkStats[a].amount).map(park => `
+                                    <tr>
+                                        <td>${{park}}</td>
+                                        <td>${{parkStats[park].count}}</td>
+                                        <td>${{formatCurrency(parkStats[park].amount)}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h3>全部项目清单（可筛选）</h3>
+                    <div style="margin: 15px 0;">
+                        <label style="display: inline-block; margin-right: 15px;">
+                            <strong>按分级筛选：</strong>
+                            <select id="level-filter-tab3" multiple style="padding: 5px; min-width: 150px;" onchange="filterTab3()">
+                                <option value="">全部</option>
+                                ${{Object.keys(levelStats).map(level => `
+                                    <option value="${{level}}">${{level || '未分类'}}</option>
+                                `).join('')}}
+                            </select>
+                        </label>
+                        <label style="display: inline-block; margin-right: 15px;">
+                            <strong>按专业筛选：</strong>
+                            <select id="prof-filter-tab3" multiple style="padding: 5px; min-width: 150px;" onchange="filterTab3()">
+                                <option value="">全部</option>
+                                ${{Object.keys(profStats).map(prof => `
+                                    <option value="${{prof}}">${{prof || '未分类'}}</option>
+                                `).join('')}}
+                            </select>
+                        </label>
+                        ${{hasProfSubcontract ? `
+                        <label style="display: inline-block;">
+                            <strong>按专业分包筛选：</strong>
+                            <select id="prof-subcontract-filter-tab3" multiple style="padding: 5px; min-width: 150px;" onchange="filterTab3()">
+                                <option value="">全部</option>
+                                ${{Object.keys(profSubcontractStats).map(key => `
+                                    <option value="${{key}}">${{key || '未分类'}}</option>
+                                `).join('')}}
+                            </select>
+                        </label>
+                        ` : ''}}
+                    </div>
+                    <div class="info-box">
+                        <p id="filter-count-tab3">共 ${{validData.length}} 条项目</p>
+                    </div>
+                    <div class="data-table-container">
+                        <table id="detail-table-tab3">
+                            <thead>
+                                <tr>
+                                    <th>园区</th>
+                                    <th>序号</th>
+                                    <th>项目分级</th>
+                                    ${{validData[0] && validData[0].项目分类 ? '<th>项目分类</th>' : ''}}
+                                    <th>专业</th>
+                                    ${{hasProfSubcontract ? '<th>专业分包</th>' : ''}}
+                                    <th>项目名称</th>
+                                    <th>拟定金额</th>
+                                    ${{validData[0] && validData[0].拟定承建组织 ? '<th>拟定承建组织</th>' : ''}}
+                                    ${{validData[0] && validData[0].需求立项 ? '<th>需求立项</th>' : ''}}
+                                    ${{validData[0] && (validData[0].验收 || validData[0]['验收(社区需求完成交付)']) ? '<th>验收</th>' : ''}}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${{validData.map(d => {{
+                                    const profSubcontractVal = hasProfSubcontract ? (getValue(d, profSubcontractCol) || '') : '';
+                                    return `
+                                    <tr data-level="${{getValue(d, '项目分级')}}" data-prof="${{getValue(d, '专业')}}" ${{hasProfSubcontract ? `data-prof-subcontract="${{profSubcontractVal}}"` : ''}}>
+                                        <td>${{getValue(d, '园区')}}</td>
+                                        <td>${{getValue(d, '序号')}}</td>
+                                        <td>${{getValue(d, '项目分级')}}</td>
+                                        ${{d.项目分类 ? `<td>${{getValue(d, '项目分类')}}</td>` : ''}}
+                                        <td>${{getValue(d, '专业')}}</td>
+                                        ${{hasProfSubcontract ? `<td>${{profSubcontractVal || '未分类'}}</td>` : ''}}
+                                        <td>${{getValue(d, '项目名称')}}</td>
+                                        <td>${{formatCurrency(getValue(d, '拟定金额'))}}</td>
+                                        ${{d.拟定承建组织 ? `<td>${{getValue(d, '拟定承建组织')}}</td>` : ''}}
+                                        ${{d.需求立项 ? `<td>${{getValue(d, '需求立项')}}</td>` : ''}}
+                                        ${{(d.验收 || d['验收(社区需求完成交付)']) ? `<td>${{getValue(d, '验收(社区需求完成交付)') || getValue(d, '验收')}}</td>` : ''}}
+                                    </tr>
+                                    `;
+                                }}).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+            
+            container.innerHTML = html;
+        }}
+        
+        // 标签页3的筛选功能
+        function filterTab3() {{
+            const levelFilter = Array.from(document.getElementById('level-filter-tab3').selectedOptions).map(opt => opt.value).filter(v => v);
+            const profFilter = Array.from(document.getElementById('prof-filter-tab3').selectedOptions).map(opt => opt.value).filter(v => v);
+            const profSubcontractFilterEl = document.getElementById('prof-subcontract-filter-tab3');
+            const profSubcontractFilter = profSubcontractFilterEl ? Array.from(profSubcontractFilterEl.selectedOptions).map(opt => opt.value).filter(v => v) : [];
+            
+            const rows = document.querySelectorAll('#detail-table-tab3 tbody tr');
+            let visibleCount = 0;
+            
+            rows.forEach(row => {{
+                const level = row.getAttribute('data-level') || '';
+                const prof = row.getAttribute('data-prof') || '';
+                const profSubcontract = row.getAttribute('data-prof-subcontract') || '';
+                
+                const levelMatch = levelFilter.length === 0 || levelFilter.includes(level);
+                const profMatch = profFilter.length === 0 || profFilter.includes(prof);
+                const profSubcontractMatch = profSubcontractFilter.length === 0 || profSubcontractFilter.includes(profSubcontract);
+                
+                if (levelMatch && profMatch && profSubcontractMatch) {{
+                    row.style.display = '';
+                    visibleCount++;
+                }} else {{
+                    row.style.display = 'none';
+                }}
+            }});
+            
+            document.getElementById('filter-count-tab3').textContent = `共 ${{visibleCount}} 条项目`;
+        }}
+        
+        // 标签页4: 总部视图
+        function renderTab4() {{
+            const validData = getValidProjects(filteredData);
+            const container = document.getElementById('tab-4');
+            
+            if (validData.length === 0) {{
+                container.innerHTML = '<div class="warning-box">当前筛选条件下暂无数据。</div>';
+                return;
+            }}
+            
+            // 稳定需求判断：需求已立项（需求立项日期有效）且非无效日期
+            const stableData = validData.filter(d => isStableRequirement(d));
+            
+            // 按园区统计稳定需求
+            const stableParkStats = {{}};
+            stableData.forEach(d => {{
+                const park = d.园区 || '未知';
+                if (!stableParkStats[park]) {{
+                    stableParkStats[park] = {{count: 0, amount: 0}};
+                }}
+                stableParkStats[park].count++;
+                stableParkStats[park].amount += parseFloat(d.拟定金额) || 0;
+            }});
+            
+            // 查找验收列和实施列
+            let acceptCol = null;
+            let implCol = null;
+            for (let key in validData[0]) {{
+                if (!acceptCol && (key.includes('验收') || key === '验收(社区需求完成交付)')) {{
+                    acceptCol = key;
+                }}
+                if (!implCol && key.includes('实施') && !key.toLowerCase().includes('时间')) {{
+                    implCol = key;
+                }}
+            }}
+            
+            // 施工进展与验收时间预告
+            const previewData = validData.map(d => {{
+                const preview = {{
+                    园区: d.园区 || '',
+                    序号: d.序号 || '',
+                    项目名称: d.项目名称 || '',
+                    拟定金额: parseFloat(d.拟定金额) || 0,
+                    拟定承建组织: d.拟定承建组织 || '',
+                    实施时间: implCol ? (d[implCol] || '') : '',
+                    验收时间: acceptCol ? (d[acceptCol] || '') : ''
+                }};
+                
+                // 判断验收日期是否有效
+                const acceptDateStr = preview.验收时间;
+                preview.验收有效 = false;
+                if (acceptDateStr && acceptDateStr !== null && acceptDateStr !== '') {{
+                    const str = String(acceptDateStr).trim();
+                    if (str && !str.startsWith('-') && !str.includes('1900')) {{
+                        preview.验收有效 = true;
+                    }}
+                }}
+                
+                return preview;
+            }});
+            
+            const acceptPreview = previewData.filter(d => d.验收有效).sort((a, b) => {{
+                const dateA = parseDate(a.验收时间);
+                const dateB = parseDate(b.验收时间);
+                if (!dateA) return 1;
+                if (!dateB) return -1;
+                return dateA - dateB;
+            }});
+            
+            let html = `
+                <div class="section">
+                    <h2>🏢 总部视图：稳定需求与施工验收</h2>
+                    
+                    <h3>各园区已确定稳定需求数量与金额</h3>
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-label">稳定需求项目数</div>
+                            <div class="metric-value">${{stableData.length}}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">稳定需求金额合计（万元）</div>
+                            <div class="metric-value">${{formatCurrency(stableData.reduce((sum, d) => sum + (parseFloat(d.拟定金额) || 0), 0))}}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr><th>园区</th><th>稳定需求数量</th><th>稳定需求金额（万元）</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{Object.keys(stableParkStats).sort((a, b) => stableParkStats[b].amount - stableParkStats[a].amount).map(park => `
+                                    <tr>
+                                        <td>${{park}}</td>
+                                        <td>${{stableParkStats[park].count}}</td>
+                                        <td>${{formatCurrency(stableParkStats[park].amount)}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h3>施工进展与验收时间预告</h3>
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>园区</th>
+                                    <th>序号</th>
+                                    <th>项目名称</th>
+                                    <th>拟定金额（万元）</th>
+                                    <th>拟定承建组织</th>
+                                    <th>实施时间</th>
+                                    <th>验收时间</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${{previewData.map(d => `
+                                    <tr style="background-color: ${{d.验收有效 ? '#e8f5e9' : ''}}">
+                                        <td>${{d.园区}}</td>
+                                        <td>${{d.序号}}</td>
+                                        <td>${{d.项目名称}}</td>
+                                        <td>${{formatCurrency(d.拟定金额)}}</td>
+                                        <td>${{d.拟定承建组织}}</td>
+                                        <td>${{d.实施时间}}</td>
+                                        <td>${{d.验收时间}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <h4>验收时间预告（仅含有效日期）</h4>
+                    ${{acceptPreview.length > 0 ? `
+                    <div class="data-table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>园区</th>
+                                    <th>序号</th>
+                                    <th>项目名称</th>
+                                    <th>拟定金额（万元）</th>
+                                    <th>拟定承建组织</th>
+                                    <th>实施时间</th>
+                                    <th>验收时间</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${{acceptPreview.map(d => `
+                                    <tr>
+                                        <td>${{d.园区}}</td>
+                                        <td>${{d.序号}}</td>
+                                        <td>${{d.项目名称}}</td>
+                                        <td>${{formatCurrency(d.拟定金额)}}</td>
+                                        <td>${{d.拟定承建组织}}</td>
+                                        <td>${{d.实施时间}}</td>
+                                        <td>${{d.验收时间}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                    ` : '<div class="info-box">暂无有效验收日期，请在一线填报「验收(社区需求完成交付)」节点。</div>'
+                    }}
+                </div>
+            `;
+            
+            container.innerHTML = html;
+        }}
+        
+        // 标签页5: 全部项目
+        function renderTab5() {{
+            const validData = getValidProjects(filteredData);
+            const container = document.getElementById('tab-5');
+            
+            if (validData.length === 0) {{
+                container.innerHTML = '<div class="warning-box">当前筛选条件下暂无数据。</div>';
+                return;
+            }}
+            
+            // 获取所有列
+            const columns = new Set();
+            validData.forEach(d => {{
+                Object.keys(d).forEach(k => columns.add(k));
+            }});
+            const columnList = ['园区', '所属区域', '城市', ...Array.from(columns).filter(c => !['园区', '所属区域', '城市'].includes(c))];
+            
+            let html = `
+                <div class="section">
+                    <h2>📑 全部项目清单</h2>
+                    <div class="info-box">
+                        <p>共 ${{validData.length}} 条项目，以下列出所有项目明细。</p>
+                    </div>
+                    <div class="data-table-container" style="overflow-x: auto;">
+                        <table style="font-size: 11px;">
+                            <thead>
+                                <tr>
+                                    ${{columnList.map(col => `<th>${{col}}</th>`).join('')}}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${{validData.map(d => `
+                                    <tr>
+                                        ${{columnList.map(col => {{
+                                            const val = getValue(d, col);
+                                            if (isValidNumber(val) && (col.includes('金额') || col.includes('金额'))) {{
+                                                return `<td>${{formatCurrency(val)}}</td>`;
+                                            }} else if (isValidNumber(val)) {{
+                                                return `<td>${{formatNumber(val)}}</td>`;
+                                            }} else {{
+                                                return `<td>${{String(val).substring(0, 50)}}</td>`;
+                                            }}
+                                        }}).join('')}}
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+            
+            container.innerHTML = html;
+        }}
+        
+        // 展开/收起功能
+        function toggleExpander(header) {{
+            header.classList.toggle('active');
+            const content = header.nextElementSibling;
+            content.classList.toggle('active');
+        }}
+        
+        // 初始化渲染
+        renderAllTabs();
+    </script>
+</body>
+</html>'''
+    
+    return html_content
+
+
+def generate_html_report(df: pd.DataFrame, 园区选择: list) -> str:
+    """生成交互式HTML报告（完全交互式）。"""
+    return generate_interactive_html(df, 园区选择)
+
+
+
+
+
+def _get_deepseek_api_key(provided: str | None = None) -> str | None:
+    """获取 DeepSeek API Key：优先使用传入值，否则 session_state、Streamlit Secrets、环境变量。"""
+    if provided and str(provided).strip():
+        return str(provided).strip()
+    key = st.session_state.get("deepseek_api_key") or ""
+    if key and str(key).strip():
+        return str(key).strip()
+    # Streamlit Secrets：无 secrets.toml 时会 FileNotFoundError，键不存在会 KeyError
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            for secret_key in ("DEEPSEEK_API_KEY", "deepseek_api_key"):
+                try:
+                    val = st.secrets[secret_key]
+                    if val and str(val).strip():
+                        return str(val).strip()
+                except (KeyError, AttributeError, TypeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return os.getenv("DEEPSEEK_API_KEY") or None
+
+
+def _get_deepseek_client(api_key: str | None = None):
+    """构造 DeepSeek 客户端，API Key 来自参数或 _get_deepseek_api_key。"""
+    final_key = api_key or _get_deepseek_api_key()
+    if not (DEEPSEEK_CLIENT_AVAILABLE and final_key):
+        return None
+    try:
+        client = OpenAI(
+            api_key=final_key,
+            base_url="https://api.deepseek.com",
+        )
+        return client
+    except Exception:
+        return None
+
+
+def _answer_with_deepseek(api_key: str | None, question: str, df: pd.DataFrame) -> str:
+    """调用 DeepSeek 接口回答使用说明或分析问题。"""
+    client = _get_deepseek_client(api_key)
+    if client is None:
+        return (
+            "未检测到可用的 DeepSeek 客户端。\n\n"
+            "请在左侧或当前页中正确填写 DeepSeek API Key（建议使用 Streamlit Secrets 或环境变量），"
+            "或联系管理员配置后再重试。"
+        )
+    # 只提供列信息，不传输完整数据
+    cols = list(df.columns)[:30]
+    system_prompt = (
+        "你是一个面向业务同事的中文 AI 助手，负责解答关于“养老社区改良改造进度管理看板”的使用问题，"
+        "并根据已经加载到应用中的 DataFrame 数据给出简单的数据查询建议。\n\n"
+        "返回要求：\n"
+        "1. 用简体中文回答。\n"
+        "2. 如果问题是“如何使用”类（例如如何上传、如何手动输入数据），请用步骤化说明回答。\n"
+        "3. 如果是“帮我查找/统计”类问题，请：\n"
+        "   - 先用自然语言说明大致的筛选逻辑（比如要按哪个字段、什么条件过滤、是否与月份有关等）；\n"
+        "   - 给出用户可以在当前看板中如何操作的指引（例如去哪个 Tab、用哪些筛选器）。\n"
+        "4. 不要编造不存在的字段名，字段名仅限于下面这批实际存在的列。\n"
+    )
+    user_prompt = (
+        f"用户问题：{question}\n\n"
+        f"当前数据列名如下（最多 30 个）：{', '.join(cols)}\n\n"
+        "注意：你无法直接访问完整数据，只能基于这些列名和业务含义来回答和给出操作建议。"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content or ""
+        return content.strip()
+    except Exception as e:
+        return f"调用 DeepSeek 接口失败：{e}"
+
+
+def render_地图与统计(df: pd.DataFrame, 园区选择: list):
+    """地图与统计 Tab：中国地图 + 按专业/分级/园区/区域图表。"""
+    df_with_location = _add_城市和区域列(df)
+    # 处理园区选择：如果为空或None，显示所有有园区信息的数据
+    if 园区选择 and len(园区选择) > 0:
+        valid_parks = [p for p in 园区选择 if p and pd.notna(p)]
+        if valid_parks:
+            sub = df_with_location[df_with_location["园区"].isin(valid_parks)]
+        else:
+            sub = df_with_location[df_with_location["园区"].notna()]
+    else:
+        sub = df_with_location[df_with_location["园区"].notna()]  # 只显示有园区信息的行
+
+    st.subheader("中国地图 · 各地市项目分布")
+    st.caption(
+        "红色散点为各社区/园区位置：鼠标悬停在 **园区点** 上可查看该社区「施工安全关注」"
+        "（项目名称/备注中命中：高空、动火、受限空间、噪音、油漆/涂料等关键词的条数与示例）。"
+        "悬停在 **城市圆点** 上可查看该城市下各园区及安全命中条数。"
+    )
+    safety_by_park = _compute_园区施工安全摘要(sub)
+    city_tooltip_data = _build_城市_园区明细(sub, safety_by_park=safety_by_park)
+    park_map_info = _build_park_map_悬浮(sub, safety_by_park)
+    _render_中国地图(sub, city_tooltip_data, park_map_info=park_map_info)
+    
+    st.markdown("---")
+    st.subheader("数据统计")
+    st.markdown("### 📊 按区域统计分析")
+    
+    # 区域统计表格
+    if "所属区域" in sub.columns:
+        st.markdown("#### 各区域项目统计")
+        by_region = sub.groupby("所属区域", dropna=False).agg(
+            项目数=("序号", "count"),
+            金额合计=("拟定金额", "sum"),
+            园区数=("园区", "nunique"),
+        ).reset_index()
+        by_region = by_region[by_region["所属区域"] != "其他"].sort_values("项目数", ascending=False)
+        by_region["金额合计"] = by_region["金额合计"].round(2)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("总区域数", len(by_region))
+        with col2:
+            st.metric("总项目数", int(by_region["项目数"].sum()))
+        with col3:
+            st.metric("总金额（万元）", f"{by_region['金额合计'].sum():,.0f}")
+        with col4:
+            st.metric("总园区数", int(by_region["园区数"].sum()))
+        
+        st.dataframe(by_region, use_container_width=True, hide_index=True)
+        
+        # 区域下各园区明细
+        st.markdown("#### 各区域下园区明细")
+        for region in by_region["所属区域"].unique():
+            region_df = sub[sub["所属区域"] == region]
+            parks_in_region = region_df.groupby("园区", dropna=False).agg(
+                项目数=("序号", "count"),
+                金额合计=("拟定金额", "sum"),
+            ).reset_index().sort_values("项目数", ascending=False)
+            parks_in_region["金额合计"] = parks_in_region["金额合计"].round(2)
+            
+            with st.expander(f"📌 {region}（{len(parks_in_region)}个园区，{int(parks_in_region['项目数'].sum())}个项目，{parks_in_region['金额合计'].sum():,.0f}万元）"):
+                st.dataframe(parks_in_region, use_container_width=True, hide_index=True)
+        
+        st.markdown("---")
+    
+    st.markdown("### 图表统计（暂时关闭）")
+    # 按用户要求：本区图表先全部注释停用，仅保留地图与上方统计表。
+    return
+
+    try:
+        import plotly.express as px
+    except ImportError:
+        st.warning("请安装 plotly 以使用美化图表：pip install plotly")
+        _render_图表_简易(sub)
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**按专业 · 项目数**")
+        by_prof = sub.groupby("专业", dropna=False).agg(项目数=("序号", "count")).reset_index().sort_values("项目数", ascending=False)
+        # 过滤掉"其它系统"分类
+        by_prof = by_prof[~by_prof["专业"].isin(["其它系统", "其他系统"])]
+        if not by_prof.empty:
+            fig = px.bar(
+                by_prof, x="专业", y="项目数", color="项目数",
+                color_continuous_scale="Blues", text_auto=".0f",
+            )
+            fig.update_layout(xaxis_tickangle=-45, showlegend=False, margin=dict(t=20, b=80), height=320, xaxis_title="", yaxis_title="项目数")
+            fig.update_traces(textfont_size=10)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    with c2:
+        st.markdown("**按项目分级 · 金额占比**")
+        by_level = sub.groupby("项目分级", dropna=False).agg(
+            项目数=("序号", "count"),
+            金额合计=("拟定金额", "sum")
+        ).reset_index().sort_values("金额合计", ascending=False)
+        if not by_level.empty:
+            colors = (CHART_COLORS_PIE * (1 + len(by_level) // len(CHART_COLORS_PIE)))[: len(by_level)]
+            fig = px.pie(
+                by_level, values="金额合计", names="项目分级", title="",
+                color_discrete_sequence=colors, hole=0.35,
+            )
+            fig.update_traces(
+                textposition="outside",
+                textinfo="label+percent+value",
+                texttemplate="%{label}<br>%{percent}<br>%{value:,.0f}万元",
+                textfont_size=12,
+                pull=[0.02] * len(by_level),
+            )
+            fig.update_layout(
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.2),
+                margin=dict(t=20, b=60, l=20, r=20),
+                height=380,
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("**按园区 · 金额（万元）**")
+        by_park = sub.groupby("园区", dropna=False).agg(金额合计=("拟定金额", "sum")).reset_index().sort_values("金额合计", ascending=False)
+        if not by_park.empty:
+            by_park["金额合计"] = by_park["金额合计"].round(2)
+            fig = px.bar(
+                by_park, x="园区", y="金额合计", color="金额合计",
+                color_continuous_scale="Blues", text_auto=".0f",
+            )
+            fig.update_layout(xaxis_tickangle=-45, showlegend=False, margin=dict(t=20, b=80), height=320, xaxis_title="", yaxis_title="金额（万元）")
+            fig.update_traces(textfont_size=10)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    with c4:
+        st.markdown("**按城市 · 金额（万元）**")
+        by_city = sub.groupby("城市", dropna=False).agg(金额合计=("拟定金额", "sum")).reset_index()
+        by_city = by_city[by_city["城市"] != "其他"].sort_values("金额合计", ascending=False)
+        if not by_city.empty:
+            by_city["金额合计"] = by_city["金额合计"].round(2)
+            fig = px.bar(
+                by_city, x="城市", y="金额合计", color="金额合计",
+                color_continuous_scale="Teal", text_auto=".0f",
+            )
+            fig.update_layout(xaxis_tickangle=-45, showlegend=False, margin=dict(t=20, b=80), height=320, xaxis_title="", yaxis_title="金额（万元）")
+            fig.update_traces(textfont_size=10)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("**按专业 · 金额合计（万元）**")
+    by_prof_m = sub.groupby("专业", dropna=False).agg(金额=("拟定金额", "sum")).reset_index().sort_values("金额", ascending=False)
+    # 过滤掉"其它系统"分类
+    by_prof_m = by_prof_m[~by_prof_m["专业"].isin(["其它系统", "其他系统"])]
+    if not by_prof_m.empty:
+        fig = px.bar(
+            by_prof_m, x="专业", y="金额", color="金额",
+            color_continuous_scale="Viridis", text_auto=".0f",
+        )
+        fig.update_layout(xaxis_tickangle=-45, showlegend=False, margin=dict(t=20, b=80), height=360, xaxis_title="", yaxis_title="金额（万元）")
+        fig.update_traces(textfont_size=10)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+def _render_project_wizard(df: pd.DataFrame):
+    """项目新增 / 修改：平铺表单。新增有必填校验，修改全部选填，只改想改的字段。"""
+    import uuid
+    df_raw = df.copy()
+    df_all = _ensure_project_columns(df)
+
+    mode = st.radio("操作类型", ["新增项目", "修改已有项目"], horizontal=True)
+
+    if mode == "修改已有项目":
+        st.markdown("### 步骤 1：筛选要修改的项目")
+        st.caption("先按园区筛选，再按其他条件缩小范围。支持多选，不选表示不限制。")
+
+        candidates = df_raw.copy()
+        parks_list = sorted(df_raw["园区"].dropna().astype(str).unique().tolist())
+        parks_list = [p for p in parks_list if p and str(p).strip() and str(p) != "nan"]
+
+        园区选择 = st.multiselect("园区*（至少选一个）", options=parks_list, default=parks_list[:1] if parks_list else [])
+        if 园区选择:
+            candidates = candidates[candidates["园区"].astype(str).isin(园区选择)]
+        else:
+            st.warning("请至少选择一个园区。")
+            return
+
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            专业分包选项 = _get_dropdown_options(candidates, "专业分包")
+            专业分包选择 = st.multiselect("专业分包（可选）", options=专业分包选项, default=[])
+        with col_f2:
+            业态选项 = _get_dropdown_options(candidates, "所属业态", OPT_所属业态)
+            业态选择 = st.multiselect("所属业态（可选）", options=业态选项, default=[])
+        with col_f3:
+            分级选项 = _get_dropdown_options(candidates, "项目分级", OPT_项目分级)
+            分级选择 = st.multiselect("项目分级（可选）", options=分级选项, default=[])
+
+        col_f4, col_f5, col_f6 = st.columns(3)
+        with col_f4:
+            分类选项 = _get_dropdown_options(candidates, "项目分类", OPT_项目分类)
+            分类选择 = st.multiselect("项目分类（可选）", options=分类选项, default=[])
+        with col_f5:
+            承建选项 = _get_dropdown_options(candidates, "拟定承建组织", OPT_拟定承建组织)
+            承建选择 = st.multiselect("拟定承建组织（可选）", options=承建选项, default=[])
+        with col_f6:
+            专业选项 = _get_dropdown_options(candidates, "专业", 专业大类)
+            专业选择 = st.multiselect("专业（可选）", options=专业选项, default=[])
+
+        if 专业分包选择:
+            candidates = candidates[candidates["专业分包"].astype(str).isin(专业分包选择)]
+        if 业态选择:
+            candidates = candidates[candidates["所属业态"].astype(str).isin(业态选择)]
+        if 分级选择:
+            candidates = candidates[candidates["项目分级"].astype(str).isin(分级选择)]
+        if 分类选择:
+            candidates = candidates[candidates["项目分类"].astype(str).isin(分类选择)]
+        if 承建选择:
+            candidates = candidates[candidates["拟定承建组织"].astype(str).isin(承建选择)]
+        if 专业选择:
+            candidates = candidates[candidates["专业"].astype(str).isin(专业选择)]
+
+        col_s, col_n = st.columns(2)
+        with col_s:
+            seq_input = st.text_input("按序号查找（可选）", value="", placeholder="例如：12")
+        with col_n:
+            name_kw = st.text_input("按项目名称关键词查找（可选）", value="", placeholder="例如：配电、外立面等")
+        if seq_input.strip():
+            try:
+                seq_val = int(float(seq_input.strip()))
+                candidates = candidates[pd.to_numeric(candidates["序号"], errors="coerce") == seq_val]
+            except ValueError:
+                candidates = candidates.iloc[0:0]
+        if name_kw.strip():
+            candidates = candidates[candidates["项目名称"].astype(str).str.contains(name_kw.strip(), na=False)]
+
+        if candidates.empty:
+            st.info("未找到匹配项目，可切换到“新增项目”，或调整查找条件。")
+            return
+
+        st.caption(f"找到 {len(candidates)} 条记录，请选择一条进行修改：")
+        display_cols = ["序号", "园区", "项目名称", "项目分级", "拟定金额"]
+        display_cols = [c for c in display_cols if c in candidates.columns]
+        st.dataframe(candidates[display_cols].head(50), use_container_width=True, hide_index=True)
+
+        seq_choices = sorted(candidates["序号"].dropna().astype(int).unique().tolist())
+        chosen_seq = st.selectbox("选择要修改的项目序号", options=seq_choices)
+        target_row = df_all[df_all["序号"].astype(int) == int(chosen_seq)].iloc[0]
+
+        st.markdown("---")
+        st.markdown(f"### 步骤 2：编辑项目（序号 {int(target_row['序号'])}）")
+
+        with st.form("edit_project_form"):
+            st.caption("提示：如在侧边栏勾选了「保存到数据库时同时推送到飞书」，保存后本次修改的内容（含字段变更详情）将推送到飞书。")
+            st.markdown("**基础信息**")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.text_input("序号（自动）", value=str(int(target_row["序号"])), disabled=True)
+                园区_options = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
+                园区默认 = str(target_row.get("园区", ""))
+                园区 = st.selectbox(
+                    "园区（选填）",
+                    options=[""] + 园区_options,
+                    index=(园区_options.index(园区默认) + 1) if 园区默认 in 园区_options else 0,
+                )
+            with c2:
+                区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
+                _v = str(target_row.get("所属区域", ""))
+                所属区域 = st.selectbox("所属区域（选填）", options=[""] + 区域_opts, index=区域_opts.index(_v) + 1 if _v in 区域_opts else 0)
+                城市_opts = _get_dropdown_options(df_all, "城市", list(园区_TO_城市.values()))
+                _cv = str(target_row.get("城市", ""))
+                城市 = st.selectbox("所在城市（选填）", options=[""] + 城市_opts, index=城市_opts.index(_cv) + 1 if _cv in 城市_opts else 0)
+            with c3:
+                业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
+                _ev = str(target_row.get("所属业态", ""))
+                所属业态 = st.selectbox("所属业态（选填）", options=[""] + 业态_opts, index=业态_opts.index(_ev) + 1 if _ev in 业态_opts else 0)
+
+            st.markdown("**项目属性**")
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
+                _lv = str(target_row.get("项目分级", ""))
+                项目分级 = st.selectbox("项目分级（选填）", options=[""] + 分级_opts, index=分级_opts.index(_lv) + 1 if _lv in 分级_opts else 0)
+            with c5:
+                分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
+                _cv2 = str(target_row.get("项目分类", ""))
+                项目分类 = st.selectbox("项目分类（选填）", options=[""] + 分类_opts, index=分类_opts.index(_cv2) + 1 if _cv2 in 分类_opts else 0)
+            with c6:
+                承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
+                _bv = str(target_row.get("拟定承建组织", ""))
+                拟定承建组织 = st.selectbox("拟定承建组织（选填）", options=[""] + 承建_opts, index=承建_opts.index(_bv) + 1 if _bv in 承建_opts else 0)
+
+            c7, c8 = st.columns(2)
+            with c7:
+                总部_opts = [x for x in _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注) if x]
+                _zv = str(target_row.get("总部重点关注项目", ""))
+                总部重点关注项目 = st.selectbox("总部重点关注项目（选填）", options=[""] + 总部_opts, index=总部_opts.index(_zv) + 1 if _zv in 总部_opts else 0)
+            with c8:
+                拟定金额 = st.number_input("拟定金额（万元）*", min_value=0.0, value=float(target_row.get("拟定金额") or 0.0), step=1.0)
+
+            st.markdown("**专业与名称**")
+            c9, c10 = st.columns(2)
+            with c9:
+                专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
+                _pv = str(target_row.get("专业", ""))
+                专业 = st.selectbox("专业（选填）", options=[""] + 专业_opts, index=专业_opts.index(_pv) + 1 if _pv in 专业_opts else 0)
+            with c10:
+                分包_opts = _get_dropdown_options(df_all, "专业分包")
+                _sbv = str(target_row.get("专业分包", ""))
+                专业分包 = st.selectbox("专业分包（选填）", options=[""] + 分包_opts, index=分包_opts.index(_sbv) + 1 if _sbv in 分包_opts else 0)
+            项目名称 = st.text_input("项目名称（选填）", value=str(target_row.get("项目名称", "")))
+            备注说明 = st.text_area("备注说明（选填）", value=str(target_row.get("备注说明", "")))
+
+            st.markdown("**项目节点日期**（不更新则选「不更新」）")
+            timeline_opts = ["（不更新）"] + list(TIMELINE_COLS)
+            _seq = int(target_row.get("序号", 0))
+            选择节点 = st.selectbox("选择要更新的节点", options=timeline_opts, index=0, key=f"edit_node_{_seq}")
+            edit_selected_date = None
+            if 选择节点 and 选择节点 != "（不更新）":
+                raw_val = target_row.get(选择节点, "")
+                existing_d = _str_to_date(raw_val)
+                default_d = existing_d if existing_d != SENTINEL_DATE else date(2026, 1, 1)
+                edit_selected_date = st.date_input(f"「{选择节点}」日期", value=default_d, min_value=DATE_RANGE_MIN, max_value=DATE_RANGE_MAX, format="YYYY-MM-DD", key=f"edit_date_{_seq}")
+
+            col_save, col_del = st.columns(2)
+            with col_save:
+                submitted = st.form_submit_button("💾 保存修改")
+            with col_del:
+                delete_clicked = st.form_submit_button("🗑 删除该项目")
+
+        seq_val = int(target_row["序号"])
+        if delete_clicked:
+            df_new = df_all[df_all["序号"].astype(int) != seq_val].copy()
+            save_to_db(df_new)
+            if _get_feishu_webhook_url():
+                diff = {"deleted": [_row_to_dict(target_row)], "added": [], "modified": []}
+                payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导删除")
+                push_to_feishu(payload=payload)
+            st.success(f"已删除序号为 {seq_val} 的项目。")
+            st.rerun()
+
+        if submitted:
+            if float(拟定金额 or 0) <= 0:
+                st.error("拟定金额为必填项，需大于 0。")
+                return
+            df_new = df_all.copy()
+            mask = df_new["序号"].astype(int) == seq_val
+            update_dict = {
+                "园区": 园区,
+                "所属区域": 所属区域,
+                "城市": 城市,
+                "所属业态": 所属业态,
+                "项目分级": 项目分级,
+                "项目分类": 项目分类,
+                "拟定承建组织": 拟定承建组织,
+                "总部重点关注项目": 总部重点关注项目,
+                "专业": 专业,
+                "专业分包": 专业分包,
+                "项目名称": 项目名称,
+                "备注说明": 备注说明,
+                "拟定金额": 拟定金额,
+            }
+            for col, val in update_dict.items():
+                if col in df_new.columns:
+                    df_new.loc[mask, col] = val
+            for col in TIMELINE_COLS:
+                if col not in df_new.columns:
+                    continue
+                if 选择节点 == col and edit_selected_date is not None:
+                    df_new.loc[mask, col] = _date_to_str(edit_selected_date)
+                else:
+                    df_new.loc[mask, col] = _date_to_str(_str_to_date(target_row.get(col, "")))
+            save_to_db(df_new)
+            if _get_feishu_webhook_url():
+                modified_row = df_new.loc[mask].iloc[0]
+                # 计算字段级修改详情（如 总部重点关注项目：是 → 否）
+                changes = []
+                for col in target_row.index:
+                    if col not in modified_row.index:
+                        continue
+                    ov = _format_cell(target_row[col])
+                    nv = _format_cell(modified_row[col])
+                    if ov != nv:
+                        changes.append(f"{col}：{ov or '（空）'} → {nv or '（空）'}")
+                modified_details = [{"序号": seq_val, "变更项": changes}]
+                diff = {
+                    "deleted": [],
+                    "added": [],
+                    "modified": [_row_to_dict(modified_row)],
+                    "modified_details": modified_details,
+                }
+                payload = _build_feishu_payload_from_diff(diff, len(df_new), source="向导修改")
+                push_to_feishu(payload=payload)
+            st.success("已保存修改。")
+            st.rerun()
+        return
+
+    # ---------- 新增项目 ----------
+    st.markdown("### 新增项目")
+    df_all = _ensure_project_columns(df_all)
+    next_seq = _get_next_序号(df_all)
+    required_fields = ["园区", "所属业态", "项目分级", "项目分类", "拟定承建组织", "专业", "项目名称", "拟定金额"]
+
+    with st.form("add_project_form"):
+        st.caption(f"新项目序号将自动设置为：{next_seq}")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            parks = sorted(set(df_all["园区"].dropna().astype(str).tolist()) | set(园区_TO_城市.keys()))
+            园区 = st.selectbox("园区*", options=[""] + parks)
+        with c2:
+            区域_opts = _get_dropdown_options(df_all, "所属区域", list(园区_TO_区域.values()))
+            所属区域 = st.selectbox("所属区域（选填）", options=[""] + 区域_opts)
+        with c3:
+            城市_opts = _get_dropdown_options(df_all, "城市", list(园区_TO_城市.values()))
+            城市 = st.selectbox("所在城市（选填）", options=[""] + 城市_opts)
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            业态_opts = _get_dropdown_options(df_all, "所属业态", OPT_所属业态)
+            所属业态 = st.selectbox("所属业态*", options=[""] + 业态_opts)
+        with c5:
+            分级_opts = _get_dropdown_options(df_all, "项目分级", OPT_项目分级)
+            项目分级 = st.selectbox("项目分级*", options=[""] + 分级_opts)
+        with c6:
+            分类_opts = _get_dropdown_options(df_all, "项目分类", OPT_项目分类)
+            项目分类 = st.selectbox("项目分类*", options=[""] + 分类_opts)
+
+        c7, c8 = st.columns(2)
+        with c7:
+            承建_opts = _get_dropdown_options(df_all, "拟定承建组织", OPT_拟定承建组织)
+            拟定承建组织 = st.selectbox("拟定承建组织*", options=[""] + 承建_opts)
+        with c8:
+            总部_opts = [x for x in _get_dropdown_options(df_all, "总部重点关注项目", OPT_总部重点关注) if x]
+            总部重点关注项目 = st.selectbox("总部重点关注项目（选填）", options=[""] + 总部_opts)
+
+        c9, c10 = st.columns(2)
+        with c9:
+            专业_opts = _get_dropdown_options(df_all, "专业", 专业大类)
+            专业 = st.selectbox("专业*", options=[""] + 专业_opts)
+        with c10:
+            分包_opts = _get_dropdown_options(df_all, "专业分包")
+            专业分包 = st.selectbox("专业分包（选填）", options=[""] + 分包_opts)
+
+        项目名称 = st.text_input("项目名称*")
+        备注说明 = st.text_area("备注说明（选填）")
+        拟定金额 = st.number_input("拟定金额（万元）*", min_value=0.0, value=0.0, step=1.0)
+
+        st.markdown("**项目节点日期**（不填写则选「不更新」）")
+        timeline_opts = ["（不更新）"] + list(TIMELINE_COLS)
+        选择节点 = st.selectbox("选择要填写的节点", options=timeline_opts, index=0, key="add_node_select")
+        add_selected_date = None
+        if 选择节点 and 选择节点 != "（不更新）":
+            add_selected_date = st.date_input(f"「{选择节点}」日期", value=date(2026, 1, 1), min_value=DATE_RANGE_MIN, max_value=DATE_RANGE_MAX, format="YYYY-MM-DD", key="add_date_picker")
+
+        submitted = st.form_submit_button("✅ 完成并写入数据库")
+
+    if submitted:
+        form_dict = {
+            "序号": next_seq,
+            "园区": 园区,
+            "所属区域": 所属区域,
+            "城市": 城市,
+            "所属业态": 所属业态,
+            "项目分级": 项目分级,
+            "项目分类": 项目分类,
+            "拟定承建组织": 拟定承建组织,
+            "总部重点关注项目": 总部重点关注项目,
+            "专业": 专业,
+            "专业分包": 专业分包,
+            "项目名称": 项目名称,
+            "备注说明": 备注说明,
+            "拟定金额": 拟定金额,
+        }
+        missing = [k for k in required_fields if k != "拟定金额" and not str(form_dict.get(k, "")).strip()]
+        if "拟定金额" in required_fields:
+            amt = float(form_dict.get("拟定金额") or 0)
+            if amt <= 0:
+                missing.append("拟定金额（需大于 0）")
+        if missing:
+            st.error(f"以下字段为必填：{', '.join(missing)}")
+            return
+
+        if not form_dict["所属区域"] and 园区 in 园区_TO_区域:
+            form_dict["所属区域"] = 园区_TO_区域[园区]
+        if not form_dict["城市"] and 园区 in 园区_TO_城市:
+            form_dict["城市"] = 园区_TO_城市[园区]
+
+        token = str(uuid.uuid4())
+        form_dict["上传凭证"] = token
+        for col in TIMELINE_COLS:
+            if col not in form_dict:
+                form_dict[col] = ""
+            if 选择节点 == col and add_selected_date is not None:
+                form_dict[col] = _date_to_str(add_selected_date)
+
+        df_new_row = pd.DataFrame([form_dict])
+        df_all2 = pd.concat([df_all, df_new_row], ignore_index=True)
+        save_to_db(df_all2)
+        if _get_feishu_webhook_url():
+            diff = {"deleted": [], "added": [_row_to_dict(df_new_row.iloc[0])], "modified": []}
+            payload = _build_feishu_payload_from_diff(diff, len(df_all2), source="向导新增")
+            push_to_feishu(payload=payload)
+        st.success(f"已写入数据库。上传凭证：{token}")
+        st.info("请截图或记录该凭证号，后续如需确认或审计可用于检索。")
+        st.rerun()
+
+
+def _require_feishu_login() -> bool:
+    """登录门禁：当 FEISHU_LOGIN_REQUIRED=1 或 OAuth 配置完整且未显式关闭时，未登录用户需通过飞书 OAuth 登录后才能访问。"""
+    login_required = str(os.getenv("FEISHU_LOGIN_REQUIRED", "")).strip()
+    if login_required == "0":
+        return True
+    if login_required != "1":
+        app_id = os.getenv("FEISHU_APP_ID")
+        secret = os.getenv("FEISHU_APP_SECRET")
+        redirect = os.getenv("FEISHU_REDIRECT_URI")
+        if not (app_id and secret and redirect):
+            return True
+    if not FEISHU_OAUTH_AVAILABLE:
+        st.warning("飞书登录模块未就绪，请确认 feishu_oauth.py 存在。")
+        return True
+    app_id = os.getenv("FEISHU_APP_ID")
+    secret = os.getenv("FEISHU_APP_SECRET")
+    redirect = os.getenv("FEISHU_REDIRECT_URI")
+    if not app_id or not secret or not redirect:
+        st.warning("请配置 FEISHU_APP_ID、FEISHU_APP_SECRET、FEISHU_REDIRECT_URI 以启用飞书登录。")
+        return True
+    user = st.session_state.get("feishu_user")
+    if user:
+        return True
+    query = st.query_params
+    code = query.get("code")
+    if code:
+        try:
+            u = exchange_code_for_user(code)
+            if u:
+                st.session_state["feishu_user"] = u
+                st.query_params.clear()
+                st.rerun()
+        except Exception as e:
+            st.error(f"登录失败：{e}")
+            return False
+    auth_url = build_authorize_url(redirect, state="app203")
+    st.markdown("### 请先登录")
+    st.markdown("使用飞书账号登录后即可访问本看板。")
+    st.link_button("飞书登录", auth_url, type="primary")
+    return False
+
+
+def main():
+    if not _require_feishu_login():
+        return
+
+    st.title("养老社区改良改造进度管理看板")
+    st.caption("需求审核流程：社区提出 → 分级 → 专业分类 → 预算拆分 → 一线立项 → 项目部施工 → 总部协调招采/施工 → 督促验收")
+
+    # 侧边栏：用户信息 + 数据源
+    with st.sidebar:
+        if st.session_state.get("feishu_user"):
+            u = st.session_state["feishu_user"]
+            name = u.get("name") or u.get("user_id") or u.get("open_id", "未知")
+            st.caption(f"👤 {name}")
+            if st.button("退出登录", key="logout"):
+                del st.session_state["feishu_user"]
+                st.rerun()
+        st.header("数据源")
+        source_options = ["数据库（团队共享）", "飞书多维表格", "上传文件（覆盖数据库）", "目录下全部 CSV（覆盖数据库）"]
+        source = st.radio("数据来源", source_options, index=0)
+        df_db = load_from_db()
+        df = pd.DataFrame()
+
+        if source == "飞书多维表格":
+            if not FEISHU_BITABLE_AVAILABLE:
+                st.warning("未安装飞书加载模块，请确认 feishu_bitable_loader.py 存在。")
+            elif not os.getenv("FEISHU_APP_ID") or not os.getenv("FEISHU_APP_SECRET"):
+                st.warning("请配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET（Streamlit Secrets 或环境变量）。")
+            else:
+                bitable_url = st.text_input(
+                    "飞书多维表格链接",
+                    value=os.getenv(
+                        "FEISHU_BITABLE_URL",
+                        "https://tkhome.feishu.cn/wiki/DFIYwb1ELigVNgkdJQAcoPArnRg?sheet=0zsvcA&table=tblodAIOVXskb6KM&view=vew6WTXj0C",
+                    ),
+                    placeholder="https://xxx.feishu.cn/base/AppToken 或 wiki 链接含 ?table=TableId",
+                )
+                if bitable_url.strip():
+                    if st.button("🔄 从飞书加载", key="load_feishu"):
+                        with st.spinner("正在从飞书加载..."):
+                            loaded = load_from_bitable(bitable_url.strip())
+                        if loaded.empty:
+                            st.warning("未获取到数据，请检查链接和权限（应用需有该多维表格的读取权限）。")
+                        else:
+                            st.session_state["df_from_feishu"] = loaded
+                            st.success(f"已从飞书加载，共 {len(loaded)} 条记录。")
+                            st.rerun()
+                    if "df_from_feishu" in st.session_state:
+                        df = st.session_state["df_from_feishu"]
+                        st.caption(f"当前显示飞书数据，共 {len(df)} 条。可「导入到数据库」后切换为数据库进行编辑。")
+                        if st.button("✅ 导入到数据库（覆盖）", type="primary", key="feishu_to_db"):
+                            save_to_db(df)
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已从飞书多维表格导入，共 {len(df)} 条记录。"):
+                                    st.success("已导入到数据库并推送至飞书。")
+                                else:
+                                    st.success("已导入到数据库。"); st.warning("飞书推送失败。")
+                            else:
+                                st.success("已导入到数据库。")
+                            del st.session_state["df_from_feishu"]
+                            st.rerun()
+                else:
+                    st.info("请填写飞书多维表格链接，或在 Secrets 中配置 FEISHU_BITABLE_URL。")
+
+        elif source == "数据库（团队共享）":
+            # 优先内嵌 .enc（Streamlit Cloud）；其次 改良改造报表-V4.csv
+            default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
+            if df_db.empty:
+                if default_csv.exists():
+                    try:
+                        df = load_single_csv(str(default_csv))
+                        if not df.empty:
+                            save_to_db(df)
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已用「{default_csv.name}」初始化，共 {len(df)} 条记录。"):
+                                    st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录；已推送至飞书。")
+                                else:
+                                    st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                            else:
+                                st.success(f"已用「{default_csv.name}」初始化团队共享数据库，共 {len(df)} 条记录。")
+                        else:
+                            st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
+                    except Exception as e:
+                        st.warning(f"无法从默认 CSV 加载：{e}。请通过下方“上传文件”导入。")
+                        df = pd.DataFrame()
+                else:
+                    st.info("当前数据库中暂无数据，请通过下方“上传文件”或“目录下全部 CSV”导入一次。")
+            else:
+                # 若数据库是历史旧数据（例如 337 行），直接用默认数据覆盖替换
+                if len(df_db) in LEGACY_DB_ROWS_TO_REPLACE and default_csv.exists():
+                    try:
+                        df_new = load_single_csv(str(default_csv))
+                        if not df_new.empty:
+                            save_to_db(df_new)
+                            df_db = df_new
+                    except Exception as e:
+                        st.warning(f"检测到历史旧数据但自动替换失败：{e}")
+                st.success(f"已从数据库加载，共 {len(df_db)} 条记录（所有用户共享）。")
+                df = df_db
+
+        elif source == "上传文件（覆盖数据库）":
+            uploaded = st.file_uploader(
+                "上传 CSV 或 Excel 文件（导入并覆盖数据库）",
+                type=["csv", "xlsx", "xls"],
+                help="支持 .csv 或 .xlsx。xlsx 会按分表自动识别进度表并合并（表头两行、含序号/项目分级/专业/拟定金额）。",
+            )
+            if uploaded is not None:
+                suffix = Path(uploaded.name).suffix.lower() or ".csv"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(uploaded.getvalue())
+                    tmp_path = tmp.name
+                try:
+                    name = uploaded.name
+                    园区名 = "燕园" if "燕园" in name else ("蜀园" if "蜀园" in name else None)
+                    df = load_uploaded(tmp_path, filename=name, 园区名=园区名)
+                    if df.empty:
+                        st.warning("文件已解析但未找到有效数据行。请确认：表头为两行，且含「序号」「项目分级」「专业」「拟定金额」等列。")
+                    else:
+                        st.success(f"已解析：{name}，共 {len(df)} 条记录。")
+                        if st.button("✅ 将本次上传的数据保存为团队共享数据库（覆盖原有数据）", type="primary"):
+                            save_to_db(df)
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（上传文件：{name}）"):
+                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                                else:
+                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                            else:
+                                st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"解析失败：{e}")
+                    import traceback
+                    st.code(traceback.format_exc(), language=None)
+            if df.empty and df_db.empty:
+                single_path = st.text_input("或填写本地文件路径（.csv / .xlsx）并导入数据库", value=DEFAULT_SINGLE_FILE)
+                if single_path and Path(single_path).exists():
+                    try:
+                        df = load_uploaded(single_path, filename=Path(single_path).name)
+                        st.success(f"已从路径加载，共 {len(df)} 条记录。点击下方按钮保存到数据库。")
+                        if st.button("保存到数据库", key="save_from_path"):
+                            save_to_db(df)
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（本地路径导入）"):
+                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                                else:
+                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                            else:
+                                st.success("已保存到 SQLite 数据库。")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"加载失败：{e}")
+                else:
+                    st.info("请在上方上传 CSV/Excel，或填写有效的本地文件路径。")
+            if df.empty and not df_db.empty:
+                df = df_db
+
+        else:  # 目录下全部 CSV（覆盖数据库）
+            dir_path = st.text_input("数据目录路径（导入并覆盖数据库）", value=DEFAULT_DATA_DIR)
+            pattern = st.text_input("文件名匹配", value="*养老*进度*.csv")
+            if dir_path and Path(dir_path).is_dir():
+                try:
+                    df = load_from_directory(dir_path, pattern)
+                    if df.empty:
+                        st.warning("目录已扫描但未解析到有效数据，请检查文件名与表头格式。")
+                    else:
+                        st.success(f"已从目录加载，共 {len(df)} 条记录。")
+                        if st.button("✅ 将目录数据保存为团队共享数据库（覆盖原有数据）", type="primary"):
+                            save_to_db(df)
+                            if _get_feishu_webhook_url():
+                                if push_to_feishu(f"【养老社区进度表】已更新，共 {len(df)} 条记录。（目录导入）"):
+                                    st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                                else:
+                                    st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                            else:
+                                st.success("已保存到 SQLite 数据库。所有用户刷新页面后将看到最新数据。")
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"加载失败：{e}")
+            else:
+                st.warning("请填写有效目录路径")
+
+        if not df.empty:
+            parks = df["园区"].dropna().unique().tolist()
+            parks = [p for p in parks if p and str(p).strip() and str(p) != "未知园区"]
+            if parks:
+                园区选择 = st.multiselect("筛选园区", options=parks, default=parks)
+            else:
+                园区选择 = []
+        else:
+            园区选择 = []
+
+    if df.empty:
+        st.warning("请先在侧边栏选择或上传数据源。")
+        render_审核流程说明()
+        return
+
+    # 列名/列顺序规范化，再补齐关键列
+    df = _canonicalize_df(df)
+    df = _ensure_project_columns(df)
+
+    if not df.empty and len(df) > 10:
+        has_prof = "专业" in df.columns and df["专业"].astype(str).str.strip().str.len().gt(0).sum() > len(df) // 2
+        has_name = "项目名称" in df.columns and df["项目名称"].astype(str).str.strip().str.len().gt(0).sum() > len(df) // 2
+        if not has_prof or not has_name:
+            # 自愈：若当前数据来自团队共享数据库，且检测到旧库列对齐问题，则自动用默认内嵌数据覆盖修复
+            if source == "数据库（团队共享）" and not st.session_state.get("_db_auto_repair_done", False):
+                try:
+                    default_csv = DEFAULT_BUNDLED_CSV if DEFAULT_BUNDLED_CSV.exists() else Path(DEFAULT_SINGLE_FILE)
+                    if default_csv.exists():
+                        df_new = load_single_csv(str(default_csv))
+                        if not df_new.empty:
+                            save_to_db(df_new)
+                            st.session_state["_db_auto_repair_done"] = True
+                            st.success(f"检测到旧库列对齐问题，已自动用「{default_csv.name}」重新初始化数据库（{len(df_new)} 条）。")
+                            st.rerun()
+                except Exception as e:
+                    st.session_state["_db_auto_repair_done"] = True
+                    st.warning(f"检测到旧库列对齐问题，但自动修复失败：{e}")
+
+            st.warning("当前数据中「专业」「项目名称」等列多为空，可能是旧库列对齐问题。已尝试自动修复；如仍异常，可删除/更换数据库文件或在侧边栏覆盖导入。")
+
+    # 自动添加城市和区域列（用于地图与导出）
+    df = _add_城市和区域列(df)
+
+    tab_points, tab_map, tab_wizard, tab_editor = st.tabs(
+        [
+            "改良改造要点看板",
+            "地图与区域分析",
+            "新增/修改项目",
+            "全部项目（可在线编辑）",
+        ]
+    )
+
+    with tab_points:
+        render_改良改造要点看板(df, 园区选择)
+
+    with tab_map:
+        render_地图与统计(df, 园区选择)
+
+    with tab_wizard:
+        st.subheader("项目录入 / 修改向导")
+        st.caption("按步骤逐条填写项目数据，自动生成所属区域、城市与上传凭证。")
+        if _get_feishu_webhook_url():
+            st.info("💬 只要修改了数据并保存，飞书将自动收到消息推送。")
+        _render_project_wizard(df)
+    with tab_editor:
+        st.subheader("全部项目清单（可在线编辑）")
+        st.caption(f"共 {len(df)} 条项目。可在下表中直接增删改，点击下方按钮保存到数据库。")
+        base_order = [
+            "序号", "园区", "所属区域", "城市", "所属业态",
+            "项目分级", "项目分类", "拟定承建组织", "总部重点关注项目",
+            "专业", "专业分包", "项目名称", "备注说明", "拟定金额",
+        ]
+        timeline_cols = [c for c in TIMELINE_COLS if c in df.columns]
+        extra_cols = ["上传凭证"] if "上传凭证" in df.columns else []
+        ordered_cols = [c for c in base_order + timeline_cols + extra_cols if c in df.columns]
+        df_edit = df[ordered_cols].copy()
+        edited_df = st.data_editor(
+            df_edit,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key="projects_editor",
+        )
+        col_save, col_export = st.columns([1, 1])
+        with col_save:
+            if st.button("💾 保存所有更改到数据库（团队共享）", type="primary", key="save_editor"):
+                old_df = load_from_db()
+                diff = _compute_df_diff(old_df, edited_df)
+                save_to_db(edited_df)
+                if _get_feishu_webhook_url():
+                    payload = _build_feishu_payload_from_diff(diff, len(edited_df), source="看板编辑")
+                    if push_to_feishu(payload=payload):
+                        st.success("已保存到 SQLite 数据库并已推送至飞书。")
+                    else:
+                        st.success("已保存到 SQLite 数据库。"); st.warning("飞书推送失败，请检查 Webhook 或网络。")
+                else:
+                    st.success("已保存到 SQLite 数据库。其他用户刷新页面后将看到最新数据。")
+        with col_export:
+            buf = io.BytesIO()
+            edited_df.to_excel(buf, index=False, engine="openpyxl")
+            buf.seek(0)
+            st.download_button(
+                "📥 导出 Excel (.xlsx)",
+                data=buf,
+                file_name=f"改良改造进度表_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="export_xlsx",
+            )
+
+
+if __name__ == "__main__":
+    main()
